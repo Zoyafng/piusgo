@@ -56,7 +56,7 @@ class CommerceTests(unittest.TestCase):
         with socket.socket() as sock:
             sock.bind(('127.0.0.1',0));port=sock.getsockname()[1]
         cls.base=f'http://127.0.0.1:{port}'
-        env={**os.environ,'DATABASE_URL':database_url(),'DATABASE_SCHEMA':cls.schema,'MOCK_MODE':'true','APP_ENV':'test','MAIL_MODE':'mock','MAIL_OUTBOX_DIR':str(Path(cls.temp.name)/'mail')}
+        env={**os.environ,'DATABASE_URL':database_url(),'DATABASE_SCHEMA':cls.schema,'MOCK_MODE':'true','APP_ENV':'test','MAIL_MODE':'mock','MAIL_OUTBOX_DIR':str(Path(cls.temp.name)/'mail'),'PRODUCT_IMAGE_DIR':str(Path(cls.temp.name)/'product-images')}
         cls.log=open(Path(cls.temp.name)/'server.log','w+')
         cls.server=subprocess.Popen([sys.executable,'-m','uvicorn','backend.app:app','--host','127.0.0.1','--port',str(port)],cwd=Path(__file__).resolve().parents[1],env=env,stdout=cls.log,stderr=cls.log)
         for _ in range(100):
@@ -185,8 +185,7 @@ class CommerceTests(unittest.TestCase):
 
     def test_lottery_single_entry_and_product_scope(self):
         client,_=self.user()
-        first=client.call('/lottery/enter',{})[1];second=client.call('/lottery/enter',{})[1]
-        self.assertEqual(first['won'],second['won']);self.assertTrue(second['already_entered'])
+        self.assertEqual(client.call('/lottery/enter',{})[0],410)
         uid=client.call('/me')[1]['id'];cid=secrets.token_hex(12)
         with self._fixture_db() as c:
             c.execute('INSERT INTO coupons VALUES(%s,%s,%s,%s,%s,0)',(cid,uid,'lottery:test',14800,14800))
@@ -393,10 +392,312 @@ class CommerceTests(unittest.TestCase):
         self.assertEqual(guest.call('/orders/'+o['id']+'/payment-session',{})[0],400)
         self.assertEqual(guest.call('/orders/'+o['id']+'/pay',{'method':'alipay'})[0],400)
 
+    def test_profile_update_and_privilege_boundaries(self):
+        client,address=self.user()
+        self.assertEqual(client.call('/me/profile',{'display_name':'测试昵称','phone':'+86 13800138000'})[0],200)
+        me=client.call('/me')[1]
+        self.assertEqual(me['display_name'],'测试昵称');self.assertEqual(me['email'],address)
+        self.assertEqual(client.call('/me/profile',{'display_name':'非法邮箱修改','email':'other@example.test'})[0],422)
+        self.assertEqual(client.call('/me/profile',{'display_name':'   ','phone':''})[0],400)
+        other,_=self.user();self.assertNotEqual(other.call('/me')[1]['display_name'],'测试昵称')
+        self.assertEqual(Client(self.base).call('/me/profile',{'display_name':'匿名修改'})[0],401)
+
+    def test_change_password_requires_current_password_and_revokes_sessions(self):
+        client,address=self.user();other=Client(self.base)
+        self.assertEqual(other.call('/auth/login',{'account':address,'password':'Test-only-pass-42','challenge_id':self.captcha(),'code':'QA7K'})[0],200)
+        body={'current_password':'wrong-password','new_password':'New-account-pass-93','confirmation':'New-account-pass-93'}
+        self.assertEqual(client.call('/me/password',body)[0],400)
+        body['current_password']='Test-only-pass-42';body['confirmation']='mismatch-pass-83'
+        self.assertEqual(client.call('/me/password',body)[0],400)
+        body['confirmation']=body['new_password']
+        self.assertEqual(client.call('/me/password',body)[0],200)
+        self.assertEqual(client.call('/me')[0],401);self.assertEqual(other.call('/me')[0],401)
+        self.assertEqual(client.call('/auth/login',{'account':address,'password':'Test-only-pass-42','challenge_id':self.captcha(),'code':'QA7K'})[0],401)
+        self.assertEqual(client.call('/auth/login',{'account':address,'password':body['new_password'],'challenge_id':self.captcha(),'code':'QA7K'})[0],200)
+
+    def test_login_metadata_and_custom_recharge_method(self):
+        client,address=self.user();first=client.call('/me')[1]
+        self.assertIsNotNone(first['last_login_at']);self.assertEqual(first['last_login_ip'],'127.0.0.1')
+        client.call('/auth/logout',{})
+        client.call('/auth/login',{'account':address,'password':'Test-only-pass-42','challenge_id':self.captcha(),'code':'QA7K'})
+        current=client.call('/me')[1];self.assertEqual(current['previous_login_at'],first['last_login_at'])
+        body={'amount':12345,'payment_method':'wechat','request_key':secrets.token_hex(16)}
+        status,r=client.call('/recharges',body);self.assertEqual(status,200,r)
+        self.assertEqual(r['bonus'],500);self.assertEqual(r['payment_method'],'wechat')
+        self.assertEqual(client.call('/me')[1]['balance'],12845)
+        self.assertEqual(client.call('/recharges',body)[0],200);self.assertEqual(client.call('/me')[1]['balance'],12845)
+        body['payment_method']='alipay';self.assertEqual(client.call('/recharges',body)[0],409)
+        for value in [999,1000001,123.45,True]:
+            self.assertEqual(client.call('/recharges',{'amount':value,'request_key':secrets.token_hex(16)})[0],422)
+        self.assertEqual(client.call('/recharges',{'amount':10000,'bonus':999999,'request_key':secrets.token_hex(16)})[0],422)
+
     def test_cancelled_order_cannot_be_paid(self):
         client,_=self.user();o,_=self.order(client)
         self.assertEqual(client.call('/orders/'+o['id']+'/cancel',{})[0],200)
         self.assertEqual(client.call('/orders/'+o['id']+'/pay',{'method':'mock'})[0],400)
+
+    def admin_user(self):
+        client,address=self.user()
+        with self._fixture_db() as c:c.execute("UPDATE users SET role='admin' WHERE email=%s",(address,))
+        return client,address
+
+    def test_admin_authorization_and_no_secret_leaks(self):
+        ordinary,_=self.user();admin,_=self.admin_user()
+        for resource in ['users','orders','products','tickets','coupons','ledger','lottery','mail','audit','pages']:
+            path='/admin/list/'+resource
+            self.assertEqual(Client(self.base).call(path)[0],401)
+            self.assertEqual(ordinary.call(path)[0],403)
+            status,data=admin.call(path);self.assertEqual(status,200,data)
+            for row in data['items']:
+                self.assertFalse({'password','token','guest_key','request_key','delivery'} & row.keys())
+        for path in ['/admin/overview','/admin/detail/users/fake','/admin/catalog-options']:
+            self.assertEqual(ordinary.call(path)[0],403)
+        for path in ['/admin/users/fake','/admin/products/188','/admin/tickets/fake','/admin/pages/tutorial','/admin/actions/orders/fake']:
+            self.assertEqual(ordinary.call(path,{})[0],403)
+        self.assertEqual(admin.call('/admin/list/users',origin='https://evil.example')[0],200)
+        self.assertEqual(admin.call('/admin/users/fake',{},origin='https://evil.example')[0],403)
+        self.assertEqual(ordinary.call('/auth/register',{'account':'no@example.test','password':'Test-only-pass-42','confirmation':'Test-only-pass-42','role':'admin'})[0],422)
+
+    def test_admin_disable_user_and_self_protection(self):
+        admin,_=self.admin_user();user,_=self.user();uid=user.call('/me')[1]['id']
+        body={'display_name':'后台编辑','phone':'12345','disabled':1}
+        self.assertEqual(admin.call('/admin/users/'+uid,body)[0],200)
+        self.assertEqual(user.call('/me')[0],401)
+        status,detail=admin.call('/admin/detail/users/'+uid)
+        self.assertEqual(status,200);self.assertEqual(detail['display_name'],'后台编辑');self.assertNotIn('password',detail)
+        aid=admin.call('/admin/session')[1]['id']
+        self.assertEqual(admin.call('/admin/users/'+aid,body)[0],400)
+        body['disabled']=0
+        self.assertEqual(admin.call('/admin/users/'+uid,body)[0],200)
+        self.assertEqual(user.call('/me')[0],401)  # enabling does not revive revoked sessions
+        self.assertEqual(admin.call('/admin/users/'+uid,dict(body,role='admin'))[0],422)
+
+    def test_admin_product_sync_and_stale_stock_protection(self):
+        admin,_=self.admin_user();user,_=self.user()
+        status,p=admin.call('/admin/detail/products/194');self.assertEqual(status,200)
+        keys=['version','name','category','image','badge','tags','active','variants','product_type','coupon_eligible','price','stock']
+        body={k:p[k] for k in keys}
+        try:
+            body['active']=0
+            self.assertEqual(admin.call('/admin/products/194',body)[0],200)
+            self.assertEqual(user.call('/products/194')[0],404)
+            self.assertEqual(user.call('/orders',{'product_id':194,'quantity':1,'account':'x@example.test','request_key':secrets.token_hex(16)})[0],400)
+            body={k:admin.call('/admin/detail/products/194')[1][k] for k in keys}
+            body['active']=1;body['variants'][0]['price']=4321;body['price']=4321
+            self.assertEqual(admin.call('/admin/products/194',body)[0],200)
+            self.assertEqual(user.call('/products/194')[1]['price'],4321)
+            fresh=admin.call('/admin/detail/products/194')[1];stale={k:fresh[k] for k in keys}
+            o,_=self.order(user)
+            self.assertEqual(user.call('/orders/'+o['id']+'/pay',{'method':'mock'})[0],200)
+            self.assertEqual(admin.call('/admin/products/194',stale)[0],409)
+            self.assertEqual(user.call('/products/194')[1]['stock'],fresh['stock']-1)
+        finally:
+            with self._fixture_db() as c:
+                c.execute('UPDATE products SET active=1,price=%s,stock=%s WHERE id=194',(p['price'],p['stock']))
+                for v in p['variants']:c.execute('UPDATE variants SET price=%s,stock=%s WHERE id=%s',(v['price'],v['stock'],v['id']))
+
+    def test_admin_ticket_reply_visible_only_to_owner(self):
+        admin,_=self.admin_user();user,_=self.user();other,_=self.user();o,_=self.order(user)
+        self.assertEqual(user.call('/orders/'+o['id']+'/pay',{'method':'mock'})[0],200)
+        status,t=user.call('/tickets',{'order_id':o['id'],'title':'后台售后测试','body':'需要帮助处理这个订单的使用问题','priority':'medium'})
+        self.assertEqual(status,200,t)
+        tid=user.call('/tickets')[1]['items'][0]['id']
+        self.assertEqual(admin.call('/admin/tickets/'+tid,{'status':'resolved','priority':'high','reply':'已为您处理，请查看订单。'})[0],200)
+        reply=user.call('/tickets')[1]['items'][0]
+        self.assertEqual(reply['reply'],'已为您处理，请查看订单。');self.assertEqual(reply['status'],'resolved');self.assertIsNotNone(reply['replied_at'])
+        self.assertNotIn(tid,[x['id'] for x in other.call('/tickets')[1]['items']])
+
+    def test_admin_order_actions_and_audit(self):
+        admin,_=self.admin_user();user,_=self.user();o,_=self.order(user)
+        path='/admin/actions/orders/'+o['id']
+        self.assertEqual(admin.call(path,{'action':'cancel'})[0],200)
+        self.assertEqual(user.call('/orders/'+o['id']+'/pay',{'method':'mock'})[0],400)
+        self.assertEqual(admin.call(path,{'action':'cancel'})[0],409)
+        self.assertEqual(admin.call(path,{'action':'retry'})[0],400)
+        logs=admin.call('/admin/list/audit?q='+o['id'])[1]['items']
+        self.assertTrue(any(x['event']=='admin_orders_cancel' for x in logs))
+        self.assertEqual(admin.call('/admin/list/orders?page_size=1')[1]['page_size'],1)
+        self.assertEqual(admin.call('/admin/list/orders?page=0')[0],422)
+        self.assertEqual(admin.call('/admin/list/users?q=%27%20OR%201=1--')[1]['total'],0)
+
+    def test_admin_overview_totals_and_trend(self):
+        admin,_=self.admin_user();user,_=self.user()
+        status,before=admin.call('/admin/overview');self.assertEqual(status,200,before)
+        o,_=self.order(user)
+        self.assertEqual(user.call('/orders/'+o['id']+'/pay',{'method':'mock'})[0],200)
+        status,after=admin.call('/admin/overview');self.assertEqual(status,200,after)
+        self.assertEqual(after['counts']['revenue'],before['counts']['revenue']+o['total'])
+        self.assertEqual(after['counts']['orders'],before['counts']['orders']+1)
+        self.assertEqual(after['counts']['paid'],before['counts']['paid']+1)
+        self.assertTrue(after['trend']);self.assertIn('day',after['trend'][-1])
+
+    def test_admin_pages_sync(self):
+        admin,_=self.admin_user()
+        old=admin.call('/pages/announcements')[1]
+        try:
+            body={'title':'测试公告','intro':'后台发布的说明','sections':[{'title':'更新','text':'这里是新的公告正文。'}]}
+            self.assertEqual(admin.call('/admin/pages/announcements',body)[0],200)
+            public=Client(self.base).call('/pages/announcements')[1]
+            self.assertEqual(public['title'],'测试公告');self.assertEqual(public['sections'],body['sections'])
+            self.assertEqual(admin.call('/admin/pages/announcements',dict(body,sections=[]))[0],422)
+        finally:
+            admin.call('/admin/pages/announcements',{k:old[k] for k in ['title','intro','sections']})
+
+    def test_admin_mail_retry_and_coupon_revocation(self):
+        admin,_=self.admin_user();user,_=self.user();o,_=self.order(user)
+        self.assertEqual(user.call('/orders/'+o['id']+'/pay',{'method':'mock'})[0],200)
+        with self._fixture_db() as c:
+            c.execute("UPDATE mail_outbox SET status='failed',attempts=5 WHERE order_id=%s",(o['id'],))
+            mid=c.execute('SELECT id FROM mail_outbox WHERE order_id=%s',(o['id'],)).fetchone()[0]
+            uid=user.call('/me')[1]['id'];cid=secrets.token_hex(16)
+            c.execute("INSERT INTO coupons(id,user_id,kind,amount,minimum) VALUES(%s,%s,%s,100,100)",(cid,uid,'admin-test-'+cid))
+        self.assertEqual(admin.call('/admin/actions/mail/'+mid,{'action':'retry'})[0],200)
+        self.assertEqual(admin.call('/admin/detail/mail/'+mid)[1]['status'],'queued')
+        self.assertEqual(admin.call('/admin/actions/mail/'+mid,{'action':'retry'})[0],409)
+        self.assertEqual(admin.call('/admin/actions/coupons/'+cid,{'action':'revoke'})[0],200)
+        self.assertEqual(admin.call('/admin/actions/coupons/'+cid,{'action':'revoke'})[0],409)
+
+
+    def new_catalog_product(self,admin,**changes):
+        body={'request_key':secrets.token_hex(16),'product_type':'promotion','name':'上架测试 '+secrets.token_hex(4),'category':admin.call('/admin/catalog-options')[1]['categories'][0]['id'],'image':'/assets/brand-0.png','badge':'新品','tags':['自动发货'],'active':1,'coupon_eligible':1,'price':10000,'stock':5,'variants':[{'name':'月卡','price':10000,'stock':2},{'name':'年卡','price':20000,'stock':3}]}
+        body.update(changes)
+        status,result=admin.call('/admin/products',body);self.assertEqual(status,200,result)
+        return result['id'],body
+
+    def catalog_edit(self,admin,pid):
+        p=admin.call('/admin/detail/products/'+str(pid))[1]
+        return {k:p[k] for k in ['version','product_type','name','category','image','badge','tags','active','coupon_eligible','price','stock','variants']}
+
+    def test_publish_product_and_real_checkout(self):
+        admin,_=self.admin_user();user,_=self.user();pid,body=self.new_catalog_product(admin)
+        self.assertEqual(user.call('/admin/products',body)[0],403)
+        self.assertEqual(Client(self.base).call('/admin/products',body)[0],401)
+        self.assertEqual(admin.call('/admin/products',body)[1]['id'],pid)
+        self.assertEqual(admin.call('/admin/products',dict(body,name='Different'))[0],409)
+        p=user.call('/products/'+str(pid))[1]
+        self.assertIn(pid,[x['id'] for x in user.call('/products')[1]['items']])
+        self.assertEqual(p['price'],10000);self.assertEqual(p['stock'],5);self.assertEqual(p['variant_count'],2)
+        self.assertNotIn('creation_key',p);self.assertNotIn('creation_hash',p)
+        status,o=user.call('/orders',{'product_id':pid,'variant_id':p['variants'][1]['id'],'quantity':1,'account':'x@example.test','request_key':secrets.token_hex(16)})
+        self.assertEqual(status,200,o);self.assertEqual(o['total'],20000)
+        self.assertEqual(user.call('/orders/'+o['id']+'/pay',{'method':'mock'})[0],200)
+        self.assertEqual(user.call('/products/'+str(pid))[1]['stock'],4)
+        edit=self.catalog_edit(admin,pid);edit['active']=0
+        self.assertEqual(admin.call('/admin/products/'+str(pid),edit)[0],200)
+        self.assertEqual(user.call('/products/'+str(pid))[0],404)
+        self.assertNotIn(pid,[x['id'] for x in user.call('/products')[1]['items']])
+
+    def test_catalog_coupon_switch_and_spec_removal(self):
+        admin,_=self.admin_user();user,_=self.user();pid,_=self.new_catalog_product(admin,coupon_eligible=0)
+        uid=user.call('/me')[1]['id'];cid=secrets.token_hex(16)
+        with self._fixture_db() as c:c.execute("INSERT INTO coupons(id,user_id,kind,amount,minimum) VALUES(%s,%s,%s,1000,10000)",(cid,uid,'test-'+cid))
+        p=user.call('/products/'+str(pid))[1]
+        order={'product_id':pid,'variant_id':p['variants'][0]['id'],'quantity':1,'coupon_id':cid,'request_key':secrets.token_hex(16)}
+        self.assertEqual(user.call('/orders',order)[0],400)
+        edit=self.catalog_edit(admin,pid);edit['coupon_eligible']=1
+        self.assertEqual(admin.call('/admin/products/'+str(pid),edit)[0],200)
+        status,o=user.call('/orders',order);self.assertEqual(status,200,o);self.assertEqual(o['total'],9000)
+        edit=self.catalog_edit(admin,pid)
+        edit['variants']=[v for v in edit['variants'] if v['id']!=order['variant_id']];edit['stock']=sum(v['stock'] for v in edit['variants']);edit['price']=min(v['price'] for v in edit['variants'])
+        self.assertEqual(admin.call('/admin/products/'+str(pid),edit)[0],409)
+        self.assertEqual(user.call('/orders/'+o['id']+'/pay',{'method':'mock'})[0],200)
+        edit=self.catalog_edit(admin,pid);edit['variants']=[v for v in edit['variants'] if v['id']!=order['variant_id']]
+        edit['variants'].append({'name':'季卡','price':15000,'stock':4});edit['stock']=sum(v['stock'] for v in edit['variants']);edit['price']=min(v['price'] for v in edit['variants'])
+        self.assertEqual(admin.call('/admin/products/'+str(pid),edit)[0],200)
+        p=user.call('/products/'+str(pid))[1]
+        self.assertEqual(p['stock'],7);self.assertEqual(p['price'],15000)
+        self.assertEqual(len(p['variants']),2)
+        self.assertEqual(user.call('/orders/'+o['id']+'/status')[1]['variant_name'],'月卡')
+        order['coupon_id']=None;order['request_key']=secrets.token_hex(16)
+        self.assertEqual(user.call('/orders',order)[0],400)
+
+    def test_catalog_input_validation_and_images(self):
+        import base64,io
+        from PIL import Image
+        admin,_=self.admin_user();user,_=self.user();_,body=self.new_catalog_product(admin)
+        for changes in [{'price':9999},{'stock':999},{'product_type':'unknown'},{'variants':[]},{'variants':[body['variants'][0],body['variants'][0]]},{'coupon_eligible':2},{'image':'javascript:alert(1)'},{'tags':['same','same']}]:
+            status,_=admin.call('/admin/products',dict(body,request_key=secrets.token_hex(16),**changes));self.assertIn(status,[400,422])
+        data=io.BytesIO();Image.new('RGB',(30,30),'green').save(data,format='PNG')
+        upload={'content':base64.b64encode(data.getvalue()).decode()}
+        self.assertEqual(user.call('/admin/product-image',upload)[0],403)
+        status,result=admin.call('/admin/product-image',upload);self.assertEqual(status,200,result)
+        with urllib.request.urlopen(self.base+result['url']) as r:self.assertEqual(r.headers['Content-Type'],'image/webp')
+        self.assertEqual(admin.call('/admin/product-image',{'content':'not base64'})[0],400)
+        self.assertEqual(admin.call('/admin/product-image',{'content':base64.b64encode(b'<svg/>').decode()})[0],400)
+
+    def deterministic_draw(self):
+        from contextlib import contextmanager
+        from fastapi import FastAPI
+        from backend.product_lottery import install_product_lottery
+        from backend.database import Connection
+        runtime=make_engine(url=database_url(),schema=self.schema)
+        @contextmanager
+        def isolated_db(write=False):
+            with runtime.begin() as connection:yield Connection(connection)
+        app=FastAPI();install_product_lottery(app,lambda:None,True)
+        endpoint=next(r.endpoint for r in app.routes if getattr(r,'path','')=='/api/products/{pid}/lottery' and 'POST' in r.methods)
+        return endpoint,isolated_db,runtime
+
+    def test_product_lottery_winner_idempotency_and_privacy(self):
+        from unittest.mock import patch
+        from backend.product_lottery import DrawInput
+        admin,_=self.admin_user();user,_=self.user();other,_=self.user();pid,_=self.new_catalog_product(admin,product_type='lottery')
+        p=user.call('/products/'+str(pid))[1];vid=p['variants'][1]['id'];u=user.call('/me')[1]
+        self.assertEqual(Client(self.base).call('/products/'+str(pid)+'/lottery',{'variant_id':vid})[0],401)
+        self.assertEqual(user.call('/orders',{'product_id':pid,'variant_id':vid,'quantity':1,'request_key':secrets.token_hex(16)})[0],400)
+        endpoint,isolated,runtime=self.deterministic_draw()
+        try:
+            with patch('backend.product_lottery.db',isolated),patch('backend.product_lottery.secrets.randbelow',return_value=0):
+                with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+                    results=list(pool.map(lambda _:endpoint(pid,DrawInput(variant_id=vid),u),range(4)))
+            self.assertEqual(len({r['order_id'] for r in results}),1)
+            oid=results[0]['order_id'];self.assertIsNotNone(oid)
+            self.assertEqual(sum(not r['already_entered'] for r in results),1)
+            status,o=user.call('/orders/'+oid+'/status');self.assertEqual(status,200,o)
+            self.assertEqual(o['total'],0);self.assertEqual(o['status'],'paid');self.assertEqual(o['source'],'lottery');self.assertEqual(o['variant_id'],vid);self.assertTrue(o['delivery'])
+            self.assertEqual(other.call('/orders/'+oid+'/status')[0],404)
+            self.assertEqual(user.call('/products/'+str(pid))[1]['stock'],4)
+            self.assertEqual(user.call('/products/'+str(pid)+'/lottery')[1]['participants'],1)
+            with self._fixture_db() as c:self.assertEqual(c.execute('SELECT count(*) FROM mail_outbox WHERE order_id=%s',(oid,)).fetchone()[0],1)
+            self.assertEqual(user.call('/me')[1]['balance'],0)
+        finally:runtime.dispose()
+
+    def test_product_lottery_last_stock_and_delivery_rollback(self):
+        from unittest.mock import patch
+        from backend.product_lottery import DrawInput
+        from fastapi import HTTPException
+        admin,_=self.admin_user();a,_=self.user();b,_=self.user()
+        pid,_=self.new_catalog_product(admin,product_type='lottery',price=100,stock=1,variants=[{'name':'最后一件','price':100,'stock':1}])
+        vid=a.call('/products/'+str(pid))[1]['variants'][0]['id'];ua=a.call('/me')[1];ub=b.call('/me')[1]
+        endpoint,isolated,runtime=self.deterministic_draw()
+        try:
+            with patch('backend.product_lottery.db',isolated),patch('backend.product_lottery.secrets.randbelow',return_value=0),patch('backend.product_lottery.deliver_mock_order',side_effect=RuntimeError('simulated delivery failure')):
+                with self.assertRaises(RuntimeError):endpoint(pid,DrawInput(variant_id=vid),ua)
+            self.assertEqual(a.call('/products/'+str(pid))[1]['stock'],1)
+            self.assertEqual(a.call('/products/'+str(pid)+'/lottery')[1]['participants'],0)
+            with patch('backend.product_lottery.db',isolated),patch('backend.product_lottery.secrets.randbelow',return_value=0):
+                def attempt(u):
+                    try:return endpoint(pid,DrawInput(variant_id=vid),u)
+                    except HTTPException as e:return e.status_code
+                with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:results=list(pool.map(attempt,[ua,ub]))
+            self.assertEqual(sum(isinstance(r,dict) and r['won'] for r in results),1);self.assertIn(409,results)
+            self.assertEqual(a.call('/products/'+str(pid))[1]['stock'],0)
+        finally:runtime.dispose()
+
+    def test_product_lottery_loss_and_unavailable_product(self):
+        from unittest.mock import patch
+        from backend.product_lottery import DrawInput
+        admin,_=self.admin_user();user,_=self.user();pid,_=self.new_catalog_product(admin,product_type='lottery')
+        p=user.call('/products/'+str(pid))[1];u=user.call('/me')[1]
+        endpoint,isolated,runtime=self.deterministic_draw()
+        try:
+            with patch('backend.product_lottery.db',isolated),patch('backend.product_lottery.secrets.randbelow',return_value=9):r=endpoint(pid,DrawInput(variant_id=p['variants'][0]['id']),u)
+            self.assertFalse(r['won']);self.assertIsNone(r['order_id']);self.assertEqual(user.call('/products/'+str(pid))[1]['stock'],5)
+            repeated=user.call('/products/'+str(pid)+'/lottery',{'variant_id':p['variants'][1]['id']})[1]
+            self.assertTrue(repeated['already_entered']);self.assertFalse(repeated['won']);self.assertEqual(repeated['variant_id'],p['variants'][0]['id'])
+            edit=self.catalog_edit(admin,pid);edit['active']=0;self.assertEqual(admin.call('/admin/products/'+str(pid),edit)[0],200)
+            other,_=self.user();self.assertEqual(other.call('/products/'+str(pid)+'/lottery',{'variant_id':p['variants'][0]['id']})[0],404)
+        finally:runtime.dispose()
 
 
 if __name__=='__main__':unittest.main()

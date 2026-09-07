@@ -6,14 +6,14 @@ import {Wallet} from './icons';
 import OrderReceipt,{cacheOrder} from './order-receipt';
 export default function Checkout({product:p}:{product:Product}) {
   const [me,setMe]=useState<Member|null>(null),[loaded,setLoaded]=useState(false);
-  const [quantity,setQuantity]=useState(1),[variantId,setVariantId]=useState(p.variants[0]?.id||'');
+  const [quantity,setQuantity]=useState(1),[variantId,setVariantId]=useState(p.variants.find(v=>v.stock>0)?.id||p.variants[0]?.id||'');
   const [method,setMethod]=useState<'alipay'|'wechat'|'balance'>('alipay');
   const [coupon,setCoupon]=useState(''),[error,setError]=useState(''),[busy,setBusy]=useState(false),[key,setKey]=useState('');
   const [created,setCreated]=useState<Order|null>(null);
   useEffect(()=>{setKey(crypto.randomUUID());let active=true;api<{user:Member|null}>('/checkout/session').then(m=>{if(active)setMe(m.user);}).catch(e=>{if(active&&!(e instanceof ApiError&&e.status===401))setError(errorText(e));}).finally(()=>{if(active)setLoaded(true);});return()=>{active=false;};},[]);
   const variant=p.variants.find(v=>v.id===variantId)||p.variants[0];
-  const price=variant?.price||p.price, stock=variant?.stock??0;
-  const eligible=me?.coupons.filter(c=>!c.used&&price*quantity>=c.minimum&&(!c.kind.startsWith('lottery:')||p.id===188))||[];
+  const price=variant?.price??p.price, stock=variant?.stock??0;
+  const eligible=(p.coupon_eligible?me?.coupons:[])?.filter(c=>!c.used&&price*quantity>=c.minimum&&(!c.kind.startsWith('lottery:')||p.id===188))||[];
   const discount=eligible.find(c=>c.id===coupon)?.amount||0;
   function changed(){setKey(crypto.randomUUID());setError('');}
   function changeQuantity(q:number){setQuantity(q);setCoupon('');changed();}
@@ -32,6 +32,7 @@ export default function Checkout({product:p}:{product:Product}) {
     {loaded&&!me?<label><span>电子邮箱</span><input name="email" type="email" required maxLength={191} autoComplete="email" placeholder="请输入您的常用邮箱"/><small>用于接收卡密与订单交付信息。</small></label>:null}
     <label><span>购买数量</span><div className="quantity-control"><button type="button" aria-label="减少购买数量" disabled={quantity<=1} onClick={()=>changeQuantity(quantity-1)}>−</button><input aria-label="购买数量" name="quantity" type="number" min={1} max={Math.min(10,stock)} required value={quantity} onChange={e=>changeQuantity(Number(e.target.value))}/><button type="button" aria-label="增加购买数量" disabled={quantity>=Math.min(10,stock)} onClick={()=>changeQuantity(quantity+1)}>+</button></div></label>
     <fieldset className="checkout-fieldset payment-box"><legend>支付方式</legend><div className="payment-options">{(['alipay','wechat','balance'] as const).map(value=><label className={`payment-option ${method===value?'selected':''} ${value==='balance'&&!me?'unavailable':''}`} key={value}><input type="radio" name="payment" value={value} checked={method===value} disabled={value==='balance'&&!me} onChange={()=>{setMethod(value);changed();}}/>{value==='balance'?<Wallet size={24}/>:<img src={`/assets/payment-${value}.png`} alt="" width={24} height={24}/>}<span><b>{value==='alipay'?'支付宝':value==='wechat'?'微信支付':'余额付款'}</b>{value==='balance'?<small>{me?`可用 ${money(me.balance)}`:'需先登录'}</small>:null}</span></label>)}</div><small className="payment-note">当前为模拟支付，不产生真实扣款。</small></fieldset>
+    {!p.coupon_eligible?<p className="payment-note">此商品不参与活动优惠券。</p>:null}
     {eligible.length?<label><span>优惠券</span><select value={coupon} onChange={e=>{setCoupon(e.target.value);changed();}}><option value="">不使用优惠券</option>{eligible.map(c=><option key={c.id} value={c.id}>{c.kind==='newcomer'?'新人优惠':'抽奖优惠'} · 减 {money(c.amount)}</option>)}</select></label>:null}
     <div><div className="summary-line"><span>商品总额</span><span>{money(price*quantity)}</span></div><div className="summary-line"><span>优惠金额</span><span>−{money(Math.min(price*quantity,discount))}</span></div><div className="summary-line"><span>应付金额</span><strong>{money(Math.max(0,price*quantity-discount))}</strong></div></div>{error?<p className="error-message" role="alert">{error}</p>:null}<button className="primary wide" disabled={busy||!loaded||stock<1}>{stock<1?'商品暂时缺货':busy?'正在创建订单…':'立即购买'}</button><small>提交订单后进入付款步骤。</small>
   </form></section></div>;

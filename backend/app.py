@@ -47,7 +47,8 @@ class RequestSizeLimit:
             if message['type']=='http.disconnect':
                 return
             body.extend(message.get('body',b''))
-            if len(body)>65536:
+            maximum=1500000 if scope.get('path')=='/api/admin/product-image' else 65536
+            if len(body)>maximum:
                 return await JSONResponse({'detail':'请求内容过大'},status_code=413)(scope,receive,send)
             if not message.get('more_body',False):
                 break
@@ -120,7 +121,7 @@ async def security(request: Request, call_next):
 def optional_member(request: Request):
     token = request.cookies.get('piusgo_session', '')
     with db() as c:
-        u = c.execute('SELECT u.* FROM users u JOIN sessions s ON s.user_id=u.id WHERE s.token=:p0 AND s.expires>:p1', {'p0': digest(token), 'p1': time.time()}).fetchone()
+        u = c.execute('SELECT u.* FROM users u JOIN sessions s ON s.user_id=u.id WHERE s.token=:p0 AND s.expires>:p1 AND u.disabled=0', {'p0': digest(token), 'p1': time.time()}).fetchone()
     return dict(u) if u else None
 
 
@@ -146,9 +147,13 @@ def checkout_session(request:Request,response:Response):
     return {'user':me(u) if u else None}
 
 
-def start_session(response, user_id):
+def start_session(response, user_id, request, expected_password=None):
     token = secrets.token_urlsafe(32)
     with db(True) as c:
+        latest=c.execute('SELECT * FROM users WHERE id=:id FOR UPDATE',{'id':user_id}).fetchone()
+        if not latest or latest['disabled'] or (expected_password is not None and not hmac.compare_digest(latest['password'],expected_password)):
+            fail('账号凭据已更新，请重新登录',401)
+        c.execute('UPDATE users SET previous_login_at=last_login_at,previous_login_ip=last_login_ip,last_login_at=:now,last_login_ip=:ip WHERE id=:id',{'now':time.time(),'ip':request.client.host[:64],'id':user_id})
         c.execute('DELETE FROM sessions WHERE expires < :p0', {'p0': time.time()})
         c.execute('INSERT INTO sessions VALUES(:p0,:p1,:p2)', {'p0': digest(token), 'p1': user_id, 'p2': time.time()+604800})
     response.set_cookie('piusgo_session',token,httponly=True,secure=PRODUCTION,samesite='lax',max_age=604800,path='/')
@@ -251,7 +256,7 @@ def register(body: Registration, request: Request, response: Response):
             c.execute('INSERT INTO users(id,email,password,created) VALUES(:p0,:p1,:p2,:p3)', {'p0': uid, 'p1': address, 'p2': password_hash(body.password), 'p3': time.time()})
     except IntegrityError:
         fail('该邮箱已注册，请直接登录或找回密码',409)
-    start_session(response,uid)
+    start_session(response,uid,request)
     return {'message':'注册成功'}
 
 
@@ -265,7 +270,7 @@ def login(body: Credentials, request: Request, response: Response):
         u = c.execute('SELECT * FROM users WHERE email=:p0', {'p0': address}).fetchone()
     if not u or not password_matches(body.password,u['password']):
         fail('账号或密码不正确',401)
-    start_session(response,u['id'])
+    start_session(response,u['id'],request,u['password'])
     return {'message':'登录成功'}
 
 
@@ -298,20 +303,20 @@ def me(u=Depends(member)):
         coupons = [dict(x) for x in c.execute('SELECT * FROM coupons WHERE user_id=:p0', {'p0': u['id']})]
         counts = c.execute("SELECT count(*) total,COALESCE(sum(CASE WHEN status='paid' THEN 1 ELSE 0 END),0) paid FROM orders WHERE user_id=:p0", {'p0': u['id']}).fetchone()
         ledger = [dict(x) for x in c.execute('SELECT * FROM ledger WHERE user_id=:p0 ORDER BY created DESC', {'p0': u['id']})]
-    return {'id':u['id'],'email':u['email'],'balance':u['balance'],'created':u['created'],'coupons':coupons,'orders':dict(counts),'ledger':ledger,'mock':MOCK}
+    return {'id':u['id'],'role':u['role'],'email':u['email'],'balance':u['balance'],'created':u['created'],'display_name':u['display_name'],'phone':u['phone'],'last_login_at':u['last_login_at'],'last_login_ip':u['last_login_ip'],'previous_login_at':u['previous_login_at'],'previous_login_ip':u['previous_login_ip'],'coupons':coupons,'orders':dict(counts),'ledger':ledger,'mock':MOCK}
 
 
 @app.get('/api/products')
 def products():
     with db() as c:
-        items = [dict(x) for x in c.execute('SELECT * FROM products ORDER BY id')]
+        items = [dict(x) for x in c.execute("SELECT p.id,p.category,p.name,p.image,p.price,p.stock,p.badge,p.tags,p.active,p.product_type,p.coupon_eligible,(SELECT count(*) FROM variants v WHERE v.product_id=p.id AND v.active=1) variant_count,(SELECT count(*) FROM lottery l WHERE l.product_id=p.id AND l.campaign=CAST(p.id AS TEXT)||':'||:day) lottery_participants FROM products p WHERE p.active=1 ORDER BY p.id",{'day':time.strftime('%Y-%m-%d',time.gmtime())})]
     # Preserve public reference card order, not numerical identifiers.
     seed = json.loads((ROOT/'seed.json').read_text())
     order = {p['id']:i for i,p in enumerate(seed['products'])}
     items.sort(key=lambda p:order.get(p['id'],999))
     for item in items:
         item['tags'] = json.loads(item['tags'])
-    return {'items':items,'categories':seed['categories'],'mock':MOCK}
+    return {'items':items,'categories':seed['categories'],'mock':MOCK,'lottery_ends_at':(int(time.time())//86400+1)*86400}
 
 
 @app.get('/api/products/{pid}')
@@ -319,7 +324,7 @@ def product(pid: int):
     for p in products()['items']:
         if p['id']==pid:
             with db() as c:
-                p['variants'] = [dict(v) for v in c.execute("SELECT * FROM variants WHERE product_id=:p0 ORDER BY CASE WHEN id LIKE '%-standard' THEN 0 ELSE 1 END,id", {'p0': pid})]
+                p['variants'] = [dict(v) for v in c.execute("SELECT * FROM variants WHERE product_id=:p0 AND active=1 ORDER BY price,CASE WHEN id LIKE '%-standard' THEN 0 ELSE 1 END,id", {'p0': pid})]
             return p
     fail('商品不存在',404)
 
@@ -451,7 +456,7 @@ def tickets(request:Request,u=Depends(optional_member),q:str=Query('',max_length
     params={**scope,'q':'%'+query+'%','size':page_size,'offset':(page-1)*page_size}
     if status!='all':where+=' AND status=:status';params['status']=status
     with db() as c:
-        items=[dict(x) for x in c.execute('SELECT id,order_id,title,body,status,priority,created FROM tickets WHERE '+where+' ORDER BY created DESC,id DESC LIMIT :size OFFSET :offset',params)]
+        items=[dict(x) for x in c.execute('SELECT id,order_id,title,body,status,priority,created,reply,replied_at FROM tickets WHERE '+where+' ORDER BY created DESC,id DESC LIMIT :size OFFSET :offset',params)]
         total=c.execute('SELECT count(*) AS n FROM tickets WHERE '+where,params).fetchone()['n']
         counts={r['status']:r['n'] for r in c.execute('SELECT status,count(*) AS n FROM tickets WHERE '+clause+' GROUP BY status',scope)}
         return {'items':items,'total':total,'page':page,'page_size':page_size,'counts':counts}
@@ -478,51 +483,87 @@ def newcomer(u=Depends(member)):
     return {'message':'新人优惠券已到账：满 100 元减 10 元，每位用户限领一次'}
 
 
+class ProfileUpdate(InputModel):
+    display_name:str=Field(min_length=1,max_length=40)
+    phone:str=Field(default='',max_length=24)
+
+
+@app.post('/api/me/profile')
+def update_profile(body:ProfileUpdate,u=Depends(member)):
+    limit('profile:'+u['id'],10,60)
+    name=body.display_name.strip();phone=body.phone.strip()
+    if not name or any(ord(ch)<32 for ch in name):fail('请输入有效昵称')
+    if phone and not re.fullmatch(r'\+?[0-9][0-9 -]{5,22}[0-9]',phone):fail('请输入有效联系电话')
+    with db(True) as c:
+        c.execute('UPDATE users SET display_name=:name,phone=:phone WHERE id=:id',{'name':name,'phone':phone,'id':u['id']})
+        c.execute('INSERT INTO audit_events(user_id,event,object_id,created) VALUES(:uid,\'profile_updated\',:uid,:now)',{'uid':u['id'],'now':time.time()})
+    return {'message':'个人信息已保存'}
+
+
+class PasswordChange(InputModel):
+    current_password:str=Field(min_length=1,max_length=128)
+    new_password:str=Field(min_length=8,max_length=128)
+    confirmation:str=Field(min_length=8,max_length=128)
+
+
+@app.post('/api/me/password')
+def change_password(body:PasswordChange,response:Response,u=Depends(member)):
+    limit('password-change:'+u['id'],5,600)
+    if body.new_password!=body.confirmation:fail('两次新密码输入不一致')
+    if body.new_password==body.current_password:fail('新密码不能与当前密码相同')
+    with db(True) as c:
+        latest=c.execute('SELECT password FROM users WHERE id=:id FOR UPDATE',{'id':u['id']}).fetchone()
+        if not latest or not password_matches(body.current_password,latest['password']):fail('当前密码不正确',400)
+        c.execute('UPDATE users SET password=:password WHERE id=:id',{'password':password_hash(body.new_password),'id':u['id']})
+        c.execute('DELETE FROM sessions WHERE user_id=:id',{'id':u['id']})
+        c.execute('INSERT INTO audit_events(user_id,event,object_id,created) VALUES(:uid,\'password_changed\',:uid,:now)',{'uid':u['id'],'now':time.time()})
+    response.delete_cookie('piusgo_session',path='/')
+    return {'message':'密码已修改，所有设备已退出，请重新登录'}
+
+
+RECHARGE_TIERS=[{'minimum':10000,'bonus':500},{'minimum':30000,'bonus':2000},{'minimum':50000,'bonus':5000}]
+
+@app.get('/api/recharges/options')
+def recharge_options():
+    return {'minimum':1000,'maximum':1000000,'presets':[1000,5000,10000,20000,50000,100000],'tiers':RECHARGE_TIERS,'methods':['alipay','wechat'],'mock':MOCK}
+
+
 class Recharge(InputModel):
-    amount: Literal[10000,30000,50000]
-    request_key: str = Field(min_length=16,max_length=100)
+    amount:int=Field(strict=True,ge=1000,le=1000000)
+    payment_method:Literal['mock','alipay','wechat']='mock'
+    request_key:str=Field(min_length=16,max_length=100)
 
 
 @app.post('/api/recharges')
-def recharge(body: Recharge,u=Depends(member)):
+def recharge(body:Recharge,u=Depends(member)):
     limit('recharge:'+u['id'],10,60)
-    if not MOCK:
-        fail('充值支付尚未接入',503)
-    bonus = {10000:500,30000:2000,50000:5000}[body.amount]
+    if not MOCK:fail('充值支付尚未接入',503)
+    bonus=max((t['bonus'] for t in RECHARGE_TIERS if body.amount>=t['minimum']),default=0)
     with db(True) as c:
         c.lock('recharge:'+u['id']+':'+body.request_key)
-        exists = c.execute('SELECT * FROM ledger WHERE user_id=:p0 AND request_key=:p1', {'p0': u['id'], 'p1': body.request_key}).fetchone()
+        exists=c.execute('SELECT * FROM ledger WHERE user_id=:uid AND request_key=:key',{'uid':u['id'],'key':body.request_key}).fetchone()
         if exists:
-            if exists['amount']!=body.amount:
-                fail('重复请求标识不能用于不同的充值金额',409)
+            if exists['amount']!=body.amount or exists['payment_method']!=body.payment_method:fail('重复请求标识不能用于不同的充值内容',409)
             return dict(exists)
-        rid = secrets.token_hex(12)
-        c.execute('INSERT INTO ledger VALUES(:p0,:p1,:p2,:p3,:p4,:p5)', {'p0': rid, 'p1': u['id'], 'p2': body.amount, 'p3': bonus, 'p4': time.time(), 'p5': body.request_key})
-        c.execute('UPDATE users SET balance=balance+:p0 WHERE id=:p1', {'p0': body.amount+bonus, 'p1': u['id']})
-        c.execute('INSERT INTO audit_events(user_id,event,object_id,created) VALUES(:p0,:p1,:p2,:p3)', {'p0': u['id'], 'p1': 'mock_recharge', 'p2': rid, 'p3': time.time()})
-    return {'message':'模拟充值成功','amount':body.amount,'bonus':bonus}
+        rid=secrets.token_hex(12)
+        c.execute('INSERT INTO ledger(id,user_id,amount,bonus,created,request_key,payment_method) VALUES(:id,:uid,:amount,:bonus,:now,:key,:method)',{'id':rid,'uid':u['id'],'amount':body.amount,'bonus':bonus,'now':time.time(),'key':body.request_key,'method':body.payment_method})
+        c.execute('UPDATE users SET balance=balance+:amount WHERE id=:uid',{'amount':body.amount+bonus,'uid':u['id']})
+        c.execute('INSERT INTO audit_events(user_id,event,object_id,created) VALUES(:uid,\'mock_recharge\',:id,:now)',{'uid':u['id'],'id':rid,'now':time.time()})
+    return {'id':rid,'message':'模拟充值成功','amount':body.amount,'bonus':bonus,'payment_method':body.payment_method}
 
 
 @app.get('/api/lottery')
 def lottery_info():
-    campaign = time.strftime('%Y-%m-%d',time.gmtime())
-    with db() as c:
-        count = c.execute('SELECT count(*) AS total FROM lottery WHERE campaign=:p0', {'p0': campaign}).fetchone()['total']
-    return {'campaign':campaign,'participants':count,'product_id':188,'prize':'ChatGPT Plus 商品专属优惠券','amount':14800,'probability':0.1,'ends_at':(int(time.time())//86400+1)*86400,'mock':True}
+    return {'items':[p for p in products()['items'] if p['product_type']=='lottery'],'mock':MOCK}
 
 
 @app.post('/api/lottery/enter')
 def enter_lottery(u=Depends(member)):
-    if not MOCK:
-        fail('抽奖活动尚未开放',503)
-    info = lottery_info()
-    with db(True) as c:
-        c.lock('lottery:'+u['id']+':'+info['campaign'])
-        old = c.execute('SELECT * FROM lottery WHERE user_id=:p0 AND campaign=:p1', {'p0': u['id'], 'p1': info['campaign']}).fetchone()
-        if old:
-            return {'won':bool(old['won']),'already_entered':True}
-        won = secrets.randbelow(10)==0
-        c.execute('INSERT INTO lottery VALUES(:p0,:p1,:p2,:p3)', {'p0': u['id'], 'p1': info['campaign'], 'p2': int(won), 'p3': time.time()})
-        if won:
-            c.execute('INSERT INTO coupons VALUES(:p0,:p1,:p2,:p3,:p4,0)', {'p0': secrets.token_hex(12), 'p1': u['id'], 'p2': 'lottery:'+info['campaign'], 'p3': 14800, 'p4': 14800})
-    return {'won':won,'already_entered':False}
+    fail('旧抽奖入口已停用，请选择已上架的抽奖商品参与',410)
+
+
+from backend.admin import install_admin
+install_admin(app, member)
+
+from backend.product_lottery import install_product_lottery
+install_product_lottery(app, member, MOCK)

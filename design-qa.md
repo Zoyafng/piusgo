@@ -24,7 +24,7 @@ final result: blocked
 
 - Next.js production build: passed.
 - TypeScript check: passed.
-- 27 isolated HTTP integration tests: passed, using a temporary PostgreSQL schema.
+- 30 isolated HTTP integration tests: passed, using a temporary PostgreSQL schema.
 - Frontend proxy integration: passed for registration, cookie session, order creation, mock payment, ticket persistence, logout and session invalidation.
 - Server-rendered homepage contains 24 crawlable product links and Chinese page content.
 - Product SSR includes Product JSON-LD with backend price and correct canonical URL.
@@ -61,3 +61,24 @@ User supplied a checkout screenshot and requested variant selection, guest email
 ## Guest checkout and support update
 
 Source images: reference/order-flow/ (six user screenshots). Added QR dialog, created/paid receipt, public member/guest/cache lookup, ticket records with server-side search/pagination, and priority-based ticket creation. Mock QR replaces the original merchant QR intentionally. API integration, mail worker and build are verified. Browser visual verification is still blocked by CUA startup failure.
+
+## Account/profile/recharge update
+
+The user supplied profile/recent-purchase, account-menu and recharge references. Implemented grouped personal navigation, two-column profile information, recent-purchase table, profile and password subpages, custom recharge amount/payment selection and confirmation. Type/build and backend tests passed. Pixel comparison remains unverified because browser control is unavailable.
+
+## 后台管理验收（2026-09-07）
+
+- 新增 `/admin` 独立管理界面，采用商城品牌色和独立侧栏；后台隐藏商城页头/页脚/客服组件。
+- 使用临时隔离 PostgreSQL schema 与测试账号，浏览器实际验证概览统计、成交趋势、商品分页列表、规格编辑弹窗，以及保存成功后返回列表。
+- 发现并修复统计字段别名导致的概览 500 错误；新增统计金额/数量变化的集成回归测试。
+- 修复隐藏商城页头后残留的 72px 顶部留白，侧栏提供独立滚动以支持较矮屏幕。
+- 38 项集成测试、TypeScript 与生产构建通过。未逐个浏览器操作验证全部模块；已在 390×844 浏览器视口检查商品列表，移动端导航和表格支持横向滚动；未进行真实移动设备实测。
+- 测试过程未为开发数据库中的普通用户提升权限；指定邮箱 `piusgo@plus.com` 尚未注册，因此管理员开通等待账号注册。
+
+
+## 商品发布验收（2026-09-07）
+
+- 在隔离数据库的生产构建预览中，从后台新增入口实际填写并上架「验收促销上架」；添加标准规格 ¥29.90 / 8 件和年卡 ¥199.00 / 3 件，后台汇总为到手价 ¥29.90、库存 11。
+- 返回前台后搜索「验收」，确认促销商品与后台创建的抽奖商品都出现在同一个商品列表中，名称、图片、标签、到手价、库存正确显示，不再附加硬编码抽奖卡片。
+- 打开新建商品详情并切换年卡，确认显示库存 3、应付金额 ¥199.00。
+- 44 项隔离数据库测试、TypeScript、生产构建、迁移一致性检查均通过；图片上传和抽奖中奖原子性由自动化测试验证，未通过浏览器执行真实交易或向真实开发商城添加验收商品。

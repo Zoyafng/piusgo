@@ -4,9 +4,13 @@ from pathlib import Path
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy import select, func
 from backend.database import engine
-from backend.schema import products, variants
+from backend.schema import products, variants, site_pages
+import time
 
 def seed(connection):
+    pages=json.loads((Path(__file__).parent/'pages.json').read_text())
+    for key,p in pages.items():
+        connection.execute(insert(site_pages).values(id=key,title=p['title'],intro=p['intro'],sections=json.dumps(p['sections'],ensure_ascii=False),created=time.time()).on_conflict_do_nothing())
     data=json.loads((Path(__file__).parent/'seed.json').read_text())
     for product in data['products']:
         row=dict(product,tags=json.dumps(product['tags'],ensure_ascii=False))

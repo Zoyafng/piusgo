@@ -25,8 +25,28 @@ def migrate(source):
                 records=[dict(r) for r in connection.execute('SELECT * FROM "'+table.name+'"')] if table.name in source_tables else []
                 for record in records:
                     if table.name in ('orders','tickets'):record.setdefault('guest_key',None)
-                    if table.name=='orders':record.setdefault('paid_at',None)
-                    if table.name=='tickets':record.setdefault('priority','medium')
+                    if table.name=='orders':
+                        record.setdefault('paid_at',None)
+                        record.setdefault('source','purchase')
+                    if table.name=='tickets':
+                        record.setdefault('priority','medium')
+                        record.setdefault('reply','')
+                        record.setdefault('replied_at',None)
+                    if table.name=='products':
+                        record.setdefault('active',1)
+                        record.setdefault('product_type','promotion')
+                        record.setdefault('coupon_eligible',1)
+                        record.setdefault('creation_key',None)
+                        record.setdefault('creation_hash',None)
+                    if table.name=='variants':record.setdefault('active',1)
+                    if table.name=='lottery':
+                        for key in ('product_id','variant_id','order_id'):record.setdefault(key,None)
+                    if table.name=='users':
+                        record.setdefault('role','member')
+                        record.setdefault('disabled',0)
+                        for key in ('display_name','phone'):record.setdefault(key,'')
+                        for key in ('last_login_at','last_login_ip','previous_login_at','previous_login_ip'):record.setdefault(key,None)
+                    if table.name=='ledger':record.setdefault('payment_method','mock')
                 if records:target.execute(table.insert(),records)
                 copied=[dict(r) for r in target.execute(select(table)).mappings()]
                 # Validate every field (including credentials, balances and order snapshots) without logging values.

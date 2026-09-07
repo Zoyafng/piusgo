@@ -22,3 +22,6 @@ export { Copy } from '@phosphor-icons/react/dist/ssr/Copy';
 export { ShieldCheck } from '@phosphor-icons/react/dist/ssr/ShieldCheck';
 export { ChatCircleDots } from '@phosphor-icons/react/dist/ssr/ChatCircleDots';
 export { PlusCircle } from '@phosphor-icons/react/dist/ssr/PlusCircle';
+export { IdentificationCard } from '@phosphor-icons/react/dist/ssr/IdentificationCard';
+export { Key } from '@phosphor-icons/react/dist/ssr/Key';
+export { House } from '@phosphor-icons/react/dist/ssr/House';

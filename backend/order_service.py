@@ -20,7 +20,7 @@ def get_order(c,oid,user=None,guest=None,by_number=False,lock=False):
     return row
 
 def public_order(row,mask=False):
-    keys=['id','product_id','quantity','account','total','discount','status','delivery','created','paid_at','variant_id','variant_name','payment_method','name','image','email_status']
+    keys=['id','source','product_id','quantity','account','total','discount','status','delivery','created','paid_at','variant_id','variant_name','payment_method','name','image','email_status']
     result={k:row.get(k) for k in keys}
     if row['status']=='paid' and not result['email_status']:result['email_status']='not_requested'
     result['kind']='member' if row['user_id'] else 'guest'
@@ -45,11 +45,14 @@ def create_order(body,user,guest,address):
         if existing:
             if (existing['product_id'],existing['variant_id'],existing['quantity'],existing['coupon_id'],existing['account'])!=(body.product_id,variant_id,body.quantity,body.coupon_id,address):fail('重复请求标识不能用于不同订单内容',409)
             return public_order(get_order(c,existing['id'],user,guest))
+        c.lock('catalog-product:'+str(body.product_id))
         product=c.execute('SELECT * FROM products WHERE id=:id',{'id':body.product_id}).fetchone()
-        variant=c.execute('SELECT * FROM variants WHERE id=:id AND product_id=:pid',{'id':variant_id,'pid':body.product_id}).fetchone()
-        if not product or not variant or min(product['stock'],variant['stock'])<body.quantity:fail('所选商品或规格库存不足')
+        variant=c.execute('SELECT * FROM variants WHERE id=:id AND product_id=:pid AND active=1',{'id':variant_id,'pid':body.product_id}).fetchone()
+        if not product or not product['active'] or not variant or min(product['stock'],variant['stock'])<body.quantity:fail('所选商品或规格库存不足')
+        if product['product_type']=='lottery':fail('抽奖商品请从抽奖入口参与')
         total=variant['price']*body.quantity;discount=0
         if body.coupon_id:
+            if not product['coupon_eligible']:fail('此商品不参与活动优惠券')
             coupon=c.execute('SELECT * FROM coupons WHERE id=:id AND user_id=:uid AND used=0',{'id':body.coupon_id,'uid':uid}).fetchone()
             if not coupon or total<coupon['minimum']:fail('优惠券不可用或未达到使用门槛')
             if coupon['kind'].startswith('lottery:') and product['id']!=188:fail('抽奖优惠券仅限指定商品')
@@ -60,6 +63,8 @@ def create_order(body,user,guest,address):
 
 def complete_mock_payment(oid,method,user,guest,by_number=False):
     with db(True) as c:
+        snapshot=c.execute('SELECT product_id FROM orders WHERE id=:id',{'id':oid}).fetchone()
+        if snapshot:c.lock('catalog-product:'+str(snapshot['product_id']))
         o=get_order(c,oid,user,guest,by_number,True)
         if o['status']=='paid':return public_order(o,by_number)
         if o['status']!='pending':fail('当前订单不能支付')
@@ -74,11 +79,15 @@ def complete_mock_payment(oid,method,user,guest,by_number=False):
         for table,ident in [('variants',o['variant_id']),('products',o['product_id'])]:
             r=c.execute(f'UPDATE {table} SET stock=stock-:quantity WHERE id=:id AND stock>=:quantity',{'quantity':o['quantity'],'id':ident})
             if r.rowcount!=1:fail('所选规格库存不足，请重新选择商品')
-        delivery='\n'.join('MOCK-'+secrets.token_hex(12).upper()+'（演示卡密，不可兑换）' for _ in range(o['quantity']))
-        now=time.time()
-        c.execute("UPDATE orders SET status='paid',paid_at=:now,delivery=:delivery,payment_method=:method WHERE id=:id",{'id':oid,'now':now,'delivery':delivery,'method':method})
-        subject='AI云充订单交付 '+oid
-        content=f"商品：{o['name']}\n规格：{o['variant_name']}\n订单号：{oid}\n\n卡密：\n{delivery}\n\n使用指南：\n"+'\n'.join(GUIDE)
-        c.execute("INSERT INTO mail_outbox(id,order_id,recipient,subject,body,status,next_attempt,created) VALUES(:id,:oid,:recipient,:subject,:body,'queued',:now,:now) ON CONFLICT(order_id) DO NOTHING",{'id':secrets.token_hex(16),'oid':oid,'recipient':o['account'],'subject':subject,'body':content,'now':now})
-        c.execute('INSERT INTO audit_events(user_id,event,object_id,created) VALUES(:uid,:event,:oid,:now)',{'uid':o['user_id'],'event':'mock_order_paid','oid':oid,'now':now})
+        deliver_mock_order(c,o,oid,method)
         return public_order(get_order(c,oid,user,guest,by_number),by_number)
+
+
+def deliver_mock_order(c,o,oid,method):
+    delivery='\n'.join('MOCK-'+secrets.token_hex(12).upper()+'（演示卡密，不可兑换）' for _ in range(o['quantity']))
+    now=time.time()
+    c.execute("UPDATE orders SET status='paid',paid_at=:now,delivery=:delivery,payment_method=:method WHERE id=:id",{'id':oid,'now':now,'delivery':delivery,'method':method})
+    subject='AI模享订单交付 '+oid
+    content=f"商品：{o['name']}\n规格：{o['variant_name']}\n订单号：{oid}\n\n卡密：\n{delivery}\n\n使用指南：\n"+'\n'.join(GUIDE)
+    c.execute("INSERT INTO mail_outbox(id,order_id,recipient,subject,body,status,next_attempt,created) VALUES(:id,:oid,:recipient,:subject,:body,'queued',:now,:now) ON CONFLICT(order_id) DO NOTHING",{'id':secrets.token_hex(16),'oid':oid,'recipient':o['account'],'subject':subject,'body':content,'now':now})
+    c.execute('INSERT INTO audit_events(user_id,event,object_id,created) VALUES(:uid,:event,:oid,:now)',{'uid':o['user_id'],'event':'mock_order_paid','oid':oid,'now':now})
