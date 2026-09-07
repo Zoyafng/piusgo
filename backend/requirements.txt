@@ -1,0 +1,9 @@
+fastapi==0.141.1
+uvicorn==0.52.4
+Pillow==12.3.0
+starlette==1.6.0
+click==8.5.0
+SQLAlchemy==2.0.52
+alembic==1.19.2
+psycopg[binary]==3.3.5
+qrcode[pil]==8.2

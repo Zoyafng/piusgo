@@ -1,0 +1,14 @@
+{
+  "name": "piusgo",
+  "private": true,
+  "scripts": {
+    "dev": "node scripts/dev.mjs",
+    "build": "npm --prefix frontend run build",
+    "test": ".venv/bin/python -m unittest discover -s backend -p 'test_*.py' -v",
+    "db:setup": ".venv/bin/python -m backend.setup_local",
+    "db:up": "docker compose --project-name piusgo --env-file .env.postgres up -d postgres",
+    "db:stop": "docker compose --project-name piusgo --env-file .env.postgres stop postgres",
+    "db:migrate": ".venv/bin/python -m alembic upgrade head && .venv/bin/python -m backend.grants",
+    "db:check": ".venv/bin/python -m alembic check"
+  }
+}

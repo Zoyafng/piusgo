@@ -1,0 +1,14 @@
+node_modules/
+.next/
+.venv/
+.venv-next/
+.venv-legacy/
+__pycache__/
+*.sqlite3*
+.env
+.env.local
+*.tsbuildinfo
+backend/data/
+frontend/next-env.d.ts
+.env.postgres
+backend/backups/
