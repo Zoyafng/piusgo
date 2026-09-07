@@ -12,3 +12,4 @@ backend/data/
 frontend/next-env.d.ts
 .env.postgres
 backend/backups/
+deploy/backups/

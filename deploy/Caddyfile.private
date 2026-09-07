@@ -1,0 +1,9 @@
+{
+    auto_https disable_redirects
+}
+https://localhost {
+    tls internal
+    encode gzip
+    header Referrer-Policy no-referrer
+    reverse_proxy frontend:3000
+}

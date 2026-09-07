@@ -1,0 +1,17 @@
+.git
+.agents
+.codex
+.venv*
+**/node_modules
+**/.next
+**/__pycache__
+**/.env*
+**/*.sqlite3*
+**/*.dump
+**/*.tsbuildinfo
+backend/data
+backend/backups
+reference
+security
+.DS_Store
+deploy/backups

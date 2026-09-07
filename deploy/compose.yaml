@@ -1,0 +1,118 @@
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: '10m'
+    max-file: '3'
+x-backend-env: &backend-env
+  APP_ENV: production
+  MOCK_MODE: 'false'
+  WEB_ORIGIN: ${SITE_URL:-https://localhost:8443}
+  DATABASE_URL: postgresql+psycopg://piusgo_app:${APP_DB_PASSWORD:?Generate deploy/.env first}@postgres:5432/piusgo
+  CAPTCHA_FONT: /usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf
+  PRODUCT_IMAGE_DIR: /app/backend/data/product-images
+  MAIL_MODE: smtp
+  SMTP_HOST: ${SMTP_HOST:-}
+  SMTP_PORT: ${SMTP_PORT:-465}
+  SMTP_USER: ${SMTP_USER:-}
+  SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+  SMTP_FROM: ${SMTP_FROM:-}
+services:
+  postgres:
+    image: postgres:17-bookworm
+    environment:
+      POSTGRES_USER: piusgo_owner
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Generate deploy/.env first}
+      POSTGRES_DB: piusgo
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U piusgo_owner -d piusgo']
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+    logging: *logging
+  migrate:
+    image: piusgo-backend:local
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.backend
+    environment:
+      <<: *backend-env
+      MIGRATION_DATABASE_URL: postgresql+psycopg://piusgo_owner:${POSTGRES_PASSWORD:?Generate deploy/.env first}@postgres:5432/piusgo
+      APP_DB_PASSWORD: ${APP_DB_PASSWORD:?Generate deploy/.env first}
+    command: ['python', '/app/deploy/migrate.py']
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: 'no'
+    logging: *logging
+  backend:
+    image: piusgo-backend:local
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.backend
+    environment: *backend-env
+    volumes:
+      - product_images:/app/backend/data/product-images
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ['CMD', 'python', '-c', 'import urllib.request; urllib.request.urlopen("http://127.0.0.1:8000/api/products", timeout=4)']
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    logging: *logging
+  worker:
+    image: piusgo-backend:local
+    environment: *backend-env
+    command: ['python', '-m', 'backend.mail_delivery']
+    profiles: ['mail']
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+    logging: *logging
+  frontend:
+    image: piusgo-frontend:local
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.frontend
+      args:
+        SITE_URL: ${SITE_URL:-https://localhost:8443}
+    environment:
+      API_URL: http://backend:8000
+      SITE_URL: ${SITE_URL:-https://localhost:8443}
+      INDEX_SITE: 'false'
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ['CMD', 'node', '-e', 'fetch("http://127.0.0.1:3000/api/products").then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))']
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    logging: *logging
+  proxy:
+    image: caddy:2-alpine
+    ports:
+      - '${BIND_ADDRESS:-127.0.0.1}:${HTTP_PORT:-8080}:80'
+      - '${BIND_ADDRESS:-127.0.0.1}:${HTTPS_PORT:-8443}:443'
+    volumes:
+      - ${CADDY_CONFIG:-./Caddyfile.private}:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      frontend:
+        condition: service_healthy
+    restart: unless-stopped
+    logging: *logging
+volumes:
+  postgres_data:
+  product_images:
+  caddy_data:
+  caddy_config:

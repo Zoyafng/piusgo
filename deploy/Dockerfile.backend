@@ -1,0 +1,13 @@
+FROM python:3.12-slim-bookworm
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1
+WORKDIR /app
+RUN apt-get update && apt-get install -y --no-install-recommends fonts-dejavu-core && rm -rf /var/lib/apt/lists/*
+COPY backend/requirements.lock /app/backend/requirements.lock
+RUN pip install --require-hashes -r backend/requirements.lock
+RUN useradd --uid 10001 --create-home app
+COPY backend /app/backend
+COPY alembic.ini /app/alembic.ini
+COPY deploy/migrate.py /app/deploy/migrate.py
+RUN mkdir -p /app/backend/data/product-images && chown -R app:app /app/backend/data
+USER app
+CMD ["python", "-m", "uvicorn", "backend.app:app", "--host", "0.0.0.0", "--port", "8000", "--no-access-log", "--no-proxy-headers"]
