@@ -358,7 +358,7 @@ def create_order(body:NewOrder,request:Request,response:Response,u=Depends(optio
 def orders(u=Depends(member),page:int=Query(1,ge=1),page_size:int=Query(20,ge=1,le=100)):
     order_service.expire_orders()
     with db() as c:
-        rows=c.execute('SELECT o.*,p.name,p.image,m.status AS email_status FROM orders o JOIN products p ON p.id=o.product_id LEFT JOIN mail_outbox m ON m.order_id=o.id WHERE o.user_id=:uid ORDER BY o.created DESC,o.id DESC LIMIT :size OFFSET :offset',{'uid':u['id'],'size':page_size,'offset':(page-1)*page_size})
+        rows=c.execute('SELECT o.*,COALESCE(o.product_name,p.name) AS name,COALESCE(o.product_image,p.image) AS image,m.status AS email_status FROM orders o JOIN products p ON p.id=o.product_id LEFT JOIN mail_outbox m ON m.order_id=o.id WHERE o.user_id=:uid ORDER BY o.created DESC,o.id DESC LIMIT :size OFFSET :offset',{'uid':u['id'],'size':page_size,'offset':(page-1)*page_size})
         total=c.execute('SELECT count(*) AS n FROM orders WHERE user_id=:uid',{'uid':u['id']}).fetchone()['n']
         return {'items':[order_service.public_order(x) for x in rows],'total':total,'page':page,'page_size':page_size}
 
@@ -444,7 +444,7 @@ def ticket_scope(u,guest,alias=''):
 def ticket_orders(request:Request,u=Depends(optional_member)):
     clause,scope=ticket_scope(u,guest_identity(request),'o')
     with db() as c:
-        rows=c.execute("SELECT o.*,p.name,p.image FROM orders o JOIN products p ON p.id=o.product_id WHERE "+clause+" AND o.status='paid' AND NOT EXISTS(SELECT 1 FROM tickets t WHERE t.order_id=o.id) ORDER BY o.created DESC LIMIT 100",scope)
+        rows=c.execute("SELECT o.*,COALESCE(o.product_name,p.name) AS name,COALESCE(o.product_image,p.image) AS image FROM orders o JOIN products p ON p.id=o.product_id WHERE "+clause+" AND o.status='paid' AND NOT EXISTS(SELECT 1 FROM tickets t WHERE t.order_id=o.id) ORDER BY o.created DESC LIMIT 100",scope)
         return {'items':[order_service.public_order(x) for x in rows]}
 
 

@@ -1,4 +1,4 @@
-"""HTTP integration tests against an isolated SQLite database, never user data."""
+"""HTTP integration tests against an isolated PostgreSQL database, never user data."""
 import concurrent.futures
 import hashlib
 import http.cookiejar
@@ -698,6 +698,103 @@ class CommerceTests(unittest.TestCase):
             edit=self.catalog_edit(admin,pid);edit['active']=0;self.assertEqual(admin.call('/admin/products/'+str(pid),edit)[0],200)
             other,_=self.user();self.assertEqual(other.call('/products/'+str(pid)+'/lottery',{'variant_id':p['variants'][0]['id']})[0],404)
         finally:runtime.dispose()
+
+
+    def test_order_product_snapshot_survives_catalog_rename(self):
+        admin,_=self.admin_user();user,_=self.user();pid,body=self.new_catalog_product(admin)
+        o,_=self.order(user,pid)
+        edit=self.catalog_edit(admin,pid);edit['name']='修改后的商品名称';edit['image']='/assets/brand-1.jpg'
+        self.assertEqual(admin.call('/admin/products/'+str(pid),edit)[0],200)
+        status,paid=user.call('/orders/'+o['id']+'/pay',{'method':'mock'});self.assertEqual(status,200,paid)
+        self.assertEqual(paid['name'],body['name']);self.assertEqual(paid['image'],body['image'])
+        listed=next(x for x in user.call('/orders')[1]['items'] if x['id']==o['id'])
+        self.assertEqual(listed['name'],body['name'])
+        self.assertIn(body['name'],user.call('/orders/'+o['id']+'/email')[1]['body'])
+
+    def test_expired_order_does_not_block_variant_removal(self):
+        admin,_=self.admin_user();user,_=self.user();pid,_=self.new_catalog_product(admin)
+        o,_=self.order(user,pid)
+        with self._fixture_db() as c:c.execute('UPDATE orders SET created=%s WHERE id=%s',(time.time()-1900,o['id']))
+        edit=self.catalog_edit(admin,pid);edit['variants']=[v for v in edit['variants'] if v['id']!=o['variant_id']]
+        edit['price']=min(v['price'] for v in edit['variants']);edit['stock']=sum(v['stock'] for v in edit['variants'])
+        status,result=admin.call('/admin/products/'+str(pid),edit);self.assertEqual(status,200,result)
+        with self._fixture_db() as c:self.assertEqual(c.execute('SELECT status FROM orders WHERE id=%s',(o['id'],)).fetchone()[0],'cancelled')
+
+    def test_order_request_key_cannot_change_payment_method(self):
+        user,_=self.user();o,body=self.order(user)
+        self.assertEqual(user.call('/orders',dict(body,payment_method='alipay'))[0],409)
+        self.assertEqual(user.call('/orders',body)[1]['id'],o['id'])
+        self.assertEqual(user.call('/orders/'+o['id']+'/pay',{'method':'alipay'})[0],200)
+        self.assertEqual(user.call('/orders',body)[1]['id'],o['id'])
+
+    def test_mail_stale_worker_cannot_overwrite_new_claim(self):
+        from unittest.mock import patch
+        from backend.mail_delivery import send_one
+        user,_=self.user();o,_=self.order(user)
+        self.assertEqual(user.call('/orders/'+o['id']+'/pay',{'method':'mock'})[0],200)
+        _,isolated,runtime=self.deterministic_draw()
+        test=self
+        try:
+            for failure in [False,True]:
+                with self.subTest(failure=failure):
+                    with self._fixture_db() as c:
+                        c.execute("UPDATE mail_outbox SET status='queued',attempts=0,next_attempt=0,created=-100,locked_at=NULL WHERE order_id=%s",(o['id'],))
+                    class NewerWorker:
+                        def __init__(self,*args,**kwargs):pass
+                        def __enter__(self):return self
+                        def __exit__(self,*args):return False
+                        def login(self,*args):pass
+                        def send_message(self,message):
+                            with test._fixture_db() as c:
+                                c.execute("UPDATE mail_outbox SET status='sending',attempts=2,locked_at=9999999999,error='new-claim' WHERE order_id=%s",(o['id'],))
+                            if failure:raise RuntimeError('old worker failed late')
+                    env={'MAIL_MODE':'smtp','SMTP_HOST':'invalid.test','SMTP_USER':'fixture','SMTP_PASSWORD':'fixture','SMTP_FROM':'fixture@example.test','SMTP_PORT':'465'}
+                    with patch('backend.mail_delivery.db',isolated),patch.dict(os.environ,env),patch('backend.mail_delivery.smtplib.SMTP_SSL',NewerWorker):self.assertTrue(send_one())
+                    with self._fixture_db() as c:
+                        row=c.execute('SELECT status,attempts,locked_at,error FROM mail_outbox WHERE order_id=%s',(o['id'],)).fetchone()
+                    self.assertEqual(row,('sending',2,9999999999.0,'new-claim'))
+        finally:runtime.dispose()
+
+    def test_lottery_order_key_does_not_collide_with_client_key(self):
+        from unittest.mock import patch
+        from backend.product_lottery import DrawInput,day_key
+        admin,_=self.admin_user();user,_=self.user();pid,_=self.new_catalog_product(admin,product_type='lottery')
+        p=user.call('/products/'+str(pid))[1];u=user.call('/me')[1]
+        status,_=user.call('/orders',{'product_id':194,'quantity':1,'request_key':'lottery:'+day_key(pid)})
+        self.assertEqual(status,200)
+        endpoint,isolated,runtime=self.deterministic_draw()
+        try:
+            with patch('backend.product_lottery.db',isolated),patch('backend.product_lottery.secrets.randbelow',return_value=0):r=endpoint(pid,DrawInput(variant_id=p['variants'][0]['id']),u)
+            self.assertTrue(r['won']);self.assertIsNotNone(r['order_id'])
+        finally:runtime.dispose()
+
+
+    def test_production_endpoints_fail_closed_without_payment_integration(self):
+        user,_=self.user();order,_=self.order(user)
+        with socket.socket() as sock:sock.bind(('127.0.0.1',0));port=sock.getsockname()[1]
+        env={**os.environ,'DATABASE_URL':database_url(),'DATABASE_SCHEMA':self.schema,'APP_ENV':'production','MOCK_MODE':'false','WEB_ORIGIN':'http://localhost:3000'}
+        with tempfile.TemporaryFile(mode='w+') as log:
+            server=subprocess.Popen([sys.executable,'-m','uvicorn','backend.app:app','--host','127.0.0.1','--port',str(port)],env=env,stdout=log,stderr=log)
+            try:
+                prod=Client(f'http://127.0.0.1:{port}')
+                prod.opener=urllib.request.build_opener(urllib.request.HTTPCookieProcessor(user.cookies))
+                for _ in range(100):
+                    try:
+                        if prod.call('/config')[0]==200:break
+                    except OSError:time.sleep(.05)
+                else:self.fail('Production test server did not start')
+                self.assertFalse(prod.call('/config')[1]['mock'])
+                self.assertEqual(prod.call('/me')[0],200)
+                self.assertEqual(prod.call('/orders/'+order['id']+'/pay',{'method':'mock'})[0],503)
+                self.assertEqual(prod.call('/orders/'+order['id']+'/payment-session',{})[0],503)
+                self.assertEqual(prod.call('/recharges',{'amount':10000,'request_key':secrets.token_hex(16)})[0],503)
+                self.assertEqual(prod.call('/products/194/lottery',{'variant_id':'194-standard'})[0],503)
+                self.assertEqual(prod.call('/me')[1]['balance'],0)
+                self.assertEqual(user.call('/orders/'+order['id']+'/status')[1]['status'],'pending')
+            finally:server.terminate();server.wait(timeout=10)
+        bad=subprocess.run([sys.executable,'-c','import backend.app'],env={**env,'MOCK_MODE':'true'},capture_output=True,text=True,timeout=15)
+        self.assertNotEqual(bad.returncode,0)
+        self.assertIn('MOCK_MODE must be disabled',bad.stderr)
 
 
 if __name__=='__main__':unittest.main()

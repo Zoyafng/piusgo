@@ -44,11 +44,11 @@ def send_one():
                 client.login(user,password);client.send_message(message)
             status='sent'
         with db(True) as c:
-            c.execute('UPDATE mail_outbox SET status=:status,sent_at=:now,locked_at=NULL,error=NULL WHERE id=:id',{'status':status,'now':time.time(),'id':job['id']})
+            c.execute("UPDATE mail_outbox SET status=:status,sent_at=:now,locked_at=NULL,error=NULL WHERE id=:id AND status='sending' AND locked_at=:claim AND attempts=:attempts",{'status':status,'now':time.time(),'id':job['id'],'claim':now,'attempts':job['attempts']+1})
     except Exception as error:
         attempts=job['attempts']+1
         with db(True) as c:
-            c.execute('UPDATE mail_outbox SET status=:status,next_attempt=:next,locked_at=NULL,error=:error WHERE id=:id',{'status':'failed' if attempts>=5 else 'queued','next':time.time()+min(3600,30*2**attempts),'error':type(error).__name__,'id':job['id']})
+            c.execute("UPDATE mail_outbox SET status=:status,next_attempt=:next,locked_at=NULL,error=:error WHERE id=:id AND status='sending' AND locked_at=:claim AND attempts=:attempts",{'status':'failed' if attempts>=5 else 'queued','next':time.time()+min(3600,30*2**attempts),'error':type(error).__name__,'id':job['id'],'claim':now,'attempts':attempts})
     return True
 
 if __name__=='__main__':

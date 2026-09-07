@@ -28,6 +28,8 @@ def migrate(source):
                     if table.name=='orders':
                         record.setdefault('paid_at',None)
                         record.setdefault('source','purchase')
+                        record.setdefault('product_name',None)
+                        record.setdefault('product_image',None)
                     if table.name=='tickets':
                         record.setdefault('priority','medium')
                         record.setdefault('reply','')

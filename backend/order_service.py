@@ -9,7 +9,7 @@ GUIDE = ['在订单详情中查看并复制卡密。','按照商品的兑换说�
 def fail(message,status=400):raise HTTPException(status,message)
 
 def get_order(c,oid,user=None,guest=None,by_number=False,lock=False):
-    row=c.execute('SELECT o.*,p.name,p.image,m.status AS email_status FROM orders o JOIN products p ON p.id=o.product_id LEFT JOIN mail_outbox m ON m.order_id=o.id WHERE o.id=:id'+(' FOR UPDATE OF o' if lock else ''),{'id':oid}).fetchone()
+    row=c.execute('SELECT o.*,COALESCE(o.product_name,p.name) AS name,COALESCE(o.product_image,p.image) AS image,m.status AS email_status FROM orders o JOIN products p ON p.id=o.product_id LEFT JOIN mail_outbox m ON m.order_id=o.id WHERE o.id=:id'+(' FOR UPDATE OF o' if lock else ''),{'id':oid}).fetchone()
     if not row:fail('订单不存在或无权访问',404)
     if row['user_id']:
         allowed=user is not None and row['user_id']==user['id']
@@ -44,6 +44,7 @@ def create_order(body,user,guest,address):
         variant_id=body.variant_id or str(body.product_id)+'-standard'
         if existing:
             if (existing['product_id'],existing['variant_id'],existing['quantity'],existing['coupon_id'],existing['account'])!=(body.product_id,variant_id,body.quantity,body.coupon_id,address):fail('重复请求标识不能用于不同订单内容',409)
+            if existing['status']=='pending' and existing['payment_method']!=body.payment_method:fail('重复请求标识不能用于不同支付方式',409)
             return public_order(get_order(c,existing['id'],user,guest))
         c.lock('catalog-product:'+str(body.product_id))
         product=c.execute('SELECT * FROM products WHERE id=:id',{'id':body.product_id}).fetchone()
@@ -58,7 +59,7 @@ def create_order(body,user,guest,address):
             if coupon['kind'].startswith('lottery:') and product['id']!=188:fail('抽奖优惠券仅限指定商品')
             discount=min(total,coupon['amount'])
         oid='PG'+secrets.token_hex(24).upper()
-        c.execute('INSERT INTO orders(id,user_id,guest_key,product_id,quantity,account,total,discount,coupon_id,status,created,request_key,variant_id,variant_name,payment_method) VALUES(:id,:uid,:guest,:pid,:quantity,:email,:total,:discount,:coupon,\'pending\',:created,:key,:variant,:name,:method)',{'id':oid,'uid':uid,'guest':None if uid else guest,'pid':product['id'],'quantity':body.quantity,'email':address,'total':total-discount,'discount':discount,'coupon':body.coupon_id,'created':time.time(),'key':body.request_key,'variant':variant_id,'name':variant['name'],'method':body.payment_method})
+        c.execute('INSERT INTO orders(id,user_id,guest_key,product_id,quantity,account,total,discount,coupon_id,status,created,request_key,variant_id,variant_name,payment_method,product_name,product_image) VALUES(:id,:uid,:guest,:pid,:quantity,:email,:total,:discount,:coupon,\'pending\',:created,:key,:variant,:name,:method,:product_name,:product_image)',{'id':oid,'uid':uid,'guest':None if uid else guest,'pid':product['id'],'quantity':body.quantity,'email':address,'total':total-discount,'discount':discount,'coupon':body.coupon_id,'created':time.time(),'key':body.request_key,'variant':variant_id,'name':variant['name'],'method':body.payment_method,'product_name':product['name'],'product_image':product['image']})
         return public_order(get_order(c,oid,user,guest))
 
 def complete_mock_payment(oid,method,user,guest,by_number=False):

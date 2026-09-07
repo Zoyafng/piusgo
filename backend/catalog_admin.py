@@ -2,6 +2,7 @@
 import hashlib
 import json
 import secrets
+import time
 from pathlib import Path
 from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, StrictInt
@@ -76,6 +77,7 @@ def save_product(body,user,audit,oid=None):
             event='product_created'
         else:
             c.lock('catalog-product:'+str(oid))
+            c.execute("UPDATE orders SET status='cancelled' WHERE product_id=:id AND status='pending' AND created<=:cutoff",{'id':oid,'cutoff':time.time()-1800})
             current=c.execute('SELECT * FROM products WHERE id=:id FOR UPDATE',{'id':oid}).fetchone()
             if not current:fail('商品不存在',404)
             variants=list(c.execute('SELECT id,name,price,stock FROM variants WHERE product_id=:id AND active=1 ORDER BY id FOR UPDATE',{'id':oid}))

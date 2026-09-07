@@ -55,3 +55,6 @@ lottery.append_constraint(UQ('order_id',name='uq_lottery_order_id'))
 
 orders.append_column(C('source',String(20),nullable=False,server_default='purchase'))
 orders.append_constraint(CK("source IN ('purchase','lottery')",name='ck_orders_source'))
+
+orders.append_column(C('product_name',Text))
+orders.append_column(C('product_image',Text))

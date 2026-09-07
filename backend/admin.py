@@ -42,7 +42,7 @@ VIEWS = {
     'pages': ('site_pages', 'id,title,intro,sections,created', ['id','title','intro'], 'id', 'id'),
     'users': ('users', 'id,email,display_name,phone,role,disabled,balance,created,last_login_at,last_login_ip,previous_login_at,previous_login_ip', ['id','email','display_name','phone'], 'disabled', 'created DESC,id DESC'),
     'products': ('products', 'id,category,name,image,price,stock,badge,tags,active,product_type,coupon_eligible', ['name','CAST(id AS TEXT)'], 'active', 'id DESC'),
-    'orders': ('orders', 'id,source,user_id,product_id,quantity,account,total,discount,status,created,paid_at,variant_name,payment_method,delivery', ['id','account','user_id','variant_name'], 'status', 'created DESC,id DESC'),
+    'orders': ('orders', 'id,source,user_id,product_id,product_name,product_image,quantity,account,total,discount,status,created,paid_at,variant_name,payment_method,delivery', ['id','account','user_id','variant_name'], 'status', 'created DESC,id DESC'),
     'tickets': ('tickets', 'id,user_id,order_id,title,body,status,priority,created,reply,replied_at', ['id','title','order_id','user_id'], 'status', 'created DESC,id DESC'),
     'coupons': ('coupons', 'id,user_id,kind,amount,minimum,used', ['id','user_id','kind'], 'used', 'id DESC'),
     'ledger': ('ledger', 'id,user_id,amount,bonus,payment_method,created', ['id','user_id'], 'payment_method', 'created DESC,id DESC'),
