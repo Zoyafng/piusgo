@@ -1,7 +1,9 @@
 piusgo.com {
     encode gzip
     header Referrer-Policy no-referrer
-    reverse_proxy frontend:3000
+    reverse_proxy frontend:3000 {
+        flush_interval -1
+    }
 }
 www.piusgo.com {
     redir https://piusgo.com{uri} permanent

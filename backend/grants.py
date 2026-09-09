@@ -10,6 +10,8 @@ def grant_runtime(connection,schema='public'):
     connection.execute(text(f'GRANT SELECT,INSERT,UPDATE,DELETE ON ALL TABLES IN SCHEMA "{schema}" TO piusgo_app'))
     connection.execute(text(f'GRANT USAGE,SELECT ON ALL SEQUENCES IN SCHEMA "{schema}" TO piusgo_app'))
     connection.execute(text(f'REVOKE UPDATE,DELETE ON "{schema}".audit_events FROM piusgo_app'))
+    if connection.execute(text('SELECT to_regclass(:table)'),{'table':schema+'.support_messages'}).scalar():
+        connection.execute(text(f'REVOKE UPDATE,DELETE ON "{schema}".support_messages FROM piusgo_app'))
     if schema=='public':
         connection.execute(text('REVOKE ALL ON public.alembic_version FROM piusgo_app'))
     connection.execute(text(f'REVOKE CREATE ON SCHEMA "{schema}" FROM PUBLIC,piusgo_app'))

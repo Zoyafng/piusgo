@@ -28,7 +28,7 @@ Index('ix_guest_tickets_created',tickets.c.guest_key,tickets.c.created)
 # Administrator management fields (migration 0004).
 users.append_column(C('role',String(20),nullable=False,server_default='member'))
 users.append_column(C('disabled',Integer,nullable=False,server_default='0'))
-users.append_constraint(CK("role IN ('member','admin')",name='ck_users_role'))
+users.append_constraint(CK("role IN ('member','admin','support')",name='ck_users_role'))
 users.append_constraint(CK('disabled IN (0,1)',name='ck_users_disabled'))
 products.append_column(C('active',Integer,nullable=False,server_default='1'))
 products.append_constraint(CK('active IN (0,1)',name='ck_products_active'))
@@ -58,3 +58,32 @@ orders.append_constraint(CK("source IN ('purchase','lottery')",name='ck_orders_s
 
 orders.append_column(C('product_name',Text))
 orders.append_column(C('product_image',Text))
+
+# Support chat is independent of order payment and administrative privileges.
+support_conversations=Table('support_conversations',metadata,
+ C('id',String(32),primary_key=True),C('user_id',String(32),FK('users.id')),C('guest_key',String(64)),
+ C('assigned_to',String(32),FK('users.id')),C('status',String(16),nullable=False,server_default='waiting'),
+ C('contact_email',String(191),nullable=False,server_default=''),C('order_id',String(50),FK('orders.id')),
+ C('ticket_id',String(50),FK('tickets.id')),C('last_seq',Integer,nullable=False,server_default='0'),
+ C('created',Float,nullable=False),C('updated',Float,nullable=False),
+ UQ('user_id',name='uq_support_member'),UQ('guest_key',name='uq_support_guest'),
+ CK('(user_id IS NOT NULL) <> (guest_key IS NOT NULL)',name='ck_support_owner'),
+ CK("status IN ('waiting','active','closed')",name='ck_support_status'))
+support_attachments=Table('support_attachments',metadata,
+ C('id',String(32),primary_key=True),C('conversation_id',String(32),FK('support_conversations.id'),nullable=False),
+ C('sender_key',String(80),nullable=False),C('size',Integer,nullable=False),C('sha256',String(64),nullable=False),C('created',Float,nullable=False),
+ UQ('id','conversation_id',name='uq_support_attachment_conversation'),CK('size > 0 AND size <= 2000000',name='ck_support_attachment_size'))
+support_messages=Table('support_messages',metadata,
+ C('id',String(32),primary_key=True),C('conversation_id',String(32),FK('support_conversations.id'),nullable=False),
+ C('seq',Integer,nullable=False),C('sender_key',String(80),nullable=False),C('sender_role',String(16),nullable=False),
+ C('body',Text,nullable=False),C('client_id',String(64),nullable=False),C('attachment_id',String(32)),C('created',Float,nullable=False),
+ UQ('conversation_id','seq',name='uq_support_message_seq'),UQ('conversation_id','sender_key','client_id',name='uq_support_message_idempotency'),
+ UQ('attachment_id',name='uq_support_attachment_message'),FKC(['attachment_id','conversation_id'],['support_attachments.id','support_attachments.conversation_id'],name='fk_support_message_attachment'),
+ CK("sender_role IN ('customer','agent')",name='ck_support_sender'),CK('seq > 0',name='ck_support_message_seq'))
+support_reads=Table('support_reads',metadata,C('conversation_id',String(32),FK('support_conversations.id'),primary_key=True),C('reader_key',String(80),primary_key=True),C('last_seq',Integer,nullable=False),CK('last_seq >= 0',name='ck_support_read_seq'))
+support_presence=Table('support_presence',metadata,C('user_id',String(32),FK('users.id'),primary_key=True),C('expires',Float,nullable=False))
+support_streams=Table('support_streams',metadata,C('id',String(32),primary_key=True),C('reader_key',String(80),nullable=False),C('expires',Float,nullable=False))
+support_faqs=Table('support_faqs',metadata,C('id',Integer,primary_key=True),C('category',String(40),nullable=False),C('question',String(200),nullable=False),C('answer',Text,nullable=False))
+Index('ix_support_queue',support_conversations.c.status,support_conversations.c.updated)
+Index('ix_support_assignment',support_conversations.c.assigned_to,support_conversations.c.updated)
+Index('ix_support_stream_expiry',support_streams.c.expires)

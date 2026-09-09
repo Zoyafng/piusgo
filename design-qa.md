@@ -82,3 +82,7 @@ The user supplied profile/recent-purchase, account-menu and recharge references.
 - 返回前台后搜索「验收」，确认促销商品与后台创建的抽奖商品都出现在同一个商品列表中，名称、图片、标签、到手价、库存正确显示，不再附加硬编码抽奖卡片。
 - 打开新建商品详情并切换年卡，确认显示库存 3、应付金额 ¥199.00。
 - 44 项隔离数据库测试、TypeScript、生产构建、迁移一致性检查均通过；图片上传和抽奖中奖原子性由自动化测试验证，未通过浏览器执行真实交易或向真实开发商城添加验收商品。
+
+## Self-hosted support feature
+
+Built a native React support widget and agent workbench using existing purple tokens. Backend, authorization, persistence and SSE proxy checks passed. CUA remains unavailable, so browser UI/visual acceptance is not claimed. See security/SUPPORT-REVIEW-2026-09-08.md.

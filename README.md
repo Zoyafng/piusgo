@@ -165,3 +165,9 @@ npm run build
 ## 腾讯云整套部署
 
 前端、后端、数据库、邮件工作进程与 HTTPS 网关配置见 [deploy/README.md](deploy/README.md)。默认仅允许 SSH 隧道私下验收，备案通过后切换 `piusgo.com` 公网 HTTPS；不会自动复制本地数据或启用演示支付。
+
+## 自建在线客服
+
+前台右侧在线客服打开站内聊天，客服工作台位于 `/support`。包含文字/截图、常见问题、已读/未读、接待转接、订单关联及转工单。会员与游客会话严格隔离，邮箱仅作联系方式。管理员可直接使用工作台；独立客服角色需维护者对确认过的账号授权，不会自动提权。
+
+使用、授权、附件和部署说明见 [docs/SUPPORT.md](docs/SUPPORT.md)，验证边界见 [security/SUPPORT-REVIEW-2026-09-08.md](security/SUPPORT-REVIEW-2026-09-08.md)。本地迁移至 0007，新增私有客服附件卷；没有执行云端部署。

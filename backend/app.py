@@ -47,7 +47,7 @@ class RequestSizeLimit:
             if message['type']=='http.disconnect':
                 return
             body.extend(message.get('body',b''))
-            maximum=1500000 if scope.get('path')=='/api/admin/product-image' else 65536
+            maximum=1500000 if scope.get('path') in ('/api/admin/product-image','/api/support/attachments') else 65536
             if len(body)>maximum:
                 return await JSONResponse({'detail':'请求内容过大'},status_code=413)(scope,receive,send)
             if not message.get('more_body',False):
@@ -567,3 +567,6 @@ install_admin(app, member)
 
 from backend.product_lottery import install_product_lottery
 install_product_lottery(app, member, MOCK)
+
+from backend.support import install_support
+install_support(app,optional_member,guest_identity,limit,email)

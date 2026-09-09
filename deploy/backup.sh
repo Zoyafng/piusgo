@@ -20,6 +20,6 @@ trap restore EXIT
 if (( ${#running[@]} )); then "${compose[@]}" --profile mail stop "${running[@]}"; fi
 "${compose[@]}" exec -T postgres pg_dump -U piusgo_owner -d piusgo -Fc > "deploy/backups/$stamp.dump.tmp"
 mv "deploy/backups/$stamp.dump.tmp" "deploy/backups/$stamp.dump"
-"${compose[@]}" run --rm --no-deps backend tar -C /app/backend/data -czf - product-images > "deploy/backups/$stamp-images.tar.gz.tmp"
-mv "deploy/backups/$stamp-images.tar.gz.tmp" "deploy/backups/$stamp-images.tar.gz"
+"${compose[@]}" run --rm --no-deps backend tar -C /app/backend/data -czf - product-images support-attachments > "deploy/backups/$stamp-files.tar.gz.tmp"
+mv "deploy/backups/$stamp-files.tar.gz.tmp" "deploy/backups/$stamp-files.tar.gz"
 printf 'Backup saved: deploy/backups/%s (database and images)\n' "$stamp"

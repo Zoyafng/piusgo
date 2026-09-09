@@ -56,7 +56,7 @@ class CommerceTests(unittest.TestCase):
         with socket.socket() as sock:
             sock.bind(('127.0.0.1',0));port=sock.getsockname()[1]
         cls.base=f'http://127.0.0.1:{port}'
-        env={**os.environ,'DATABASE_URL':database_url(),'DATABASE_SCHEMA':cls.schema,'MOCK_MODE':'true','APP_ENV':'test','MAIL_MODE':'mock','MAIL_OUTBOX_DIR':str(Path(cls.temp.name)/'mail'),'PRODUCT_IMAGE_DIR':str(Path(cls.temp.name)/'product-images')}
+        env={**os.environ,'DATABASE_URL':database_url(),'DATABASE_SCHEMA':cls.schema,'MOCK_MODE':'true','APP_ENV':'test','MAIL_MODE':'mock','MAIL_OUTBOX_DIR':str(Path(cls.temp.name)/'mail'),'SUPPORT_ATTACHMENT_DIR':str(Path(cls.temp.name)/'support-images'),'PRODUCT_IMAGE_DIR':str(Path(cls.temp.name)/'product-images')}
         cls.log=open(Path(cls.temp.name)/'server.log','w+')
         cls.server=subprocess.Popen([sys.executable,'-m','uvicorn','backend.app:app','--host','127.0.0.1','--port',str(port)],cwd=Path(__file__).resolve().parents[1],env=env,stdout=cls.log,stderr=cls.log)
         for _ in range(100):
@@ -796,5 +796,195 @@ class CommerceTests(unittest.TestCase):
         self.assertNotEqual(bad.returncode,0)
         self.assertIn('MOCK_MODE must be disabled',bad.stderr)
 
+
+    def support_agent(self):
+        client,address=self.user();uid=client.call('/me')[1]['id']
+        with self._fixture_db() as c:c.execute("UPDATE users SET role='support' WHERE id=%s",(uid,))
+        return client,uid
+
+    def support_start(self,client=None):
+        client=client or Client(self.base)
+        status,data=client.call('/support/session',{})
+        self.assertEqual(status,200,data)
+        return client,data['conversation']['id']
+
+    def support_send(self,client,cid,body='你好，这是测试消息',actor='customer',key=None,attachment=None):
+        return client.call('/support/conversations/'+cid+'/messages?actor='+actor,{'body':body,'client_id':key or secrets.token_hex(16),'attachment_id':attachment})
+
+    def test_support_identity_and_email_cannot_grant_access(self):
+        a,aid=self.support_start();b,bid=self.support_start()
+        self.assertNotEqual(aid,bid)
+        self.assertEqual(a.call('/support/conversations/'+bid+'/messages')[0],404)
+        for client,cid in [(a,aid),(b,bid)]:self.assertEqual(client.call('/support/conversations/'+cid+'/contact',{'email':'same@example.test'})[0],200)
+        self.assertEqual(a.call('/support/conversations/'+bid+'/messages')[0],404)
+        member,address=self.user();member,mid=self.support_start(member)
+        self.assertEqual(a.call('/support/conversations/'+mid+'/messages')[0],404)
+        self.assertEqual(a.call('/support/conversations/'+aid+'/messages?actor=agent')[0],403)
+        self.assertEqual(member.call('/support/conversations/'+mid+'/contact',{'email':'other@example.test'})[0],400)
+        self.assertEqual(a.call('/support/agent/session')[0],403)
+
+    def test_support_concurrent_message_idempotency_and_validation(self):
+        client,cid=self.support_start();key=secrets.token_hex(16)
+        cookie='; '.join(f'{x.name}={x.value}' for x in client.cookies)
+        body=json.dumps({'body':'同一条消息','client_id':key}).encode()
+        def send(_):
+            req=urllib.request.Request(self.base+'/api/support/conversations/'+cid+'/messages',data=body,headers={'Cookie':cookie,'Origin':'http://localhost:3000','X-Requested-With':'PiusGo','Content-Type':'application/json'})
+            with urllib.request.urlopen(req,timeout=15) as r:return json.load(r)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:results=list(pool.map(send,range(4)))
+        self.assertEqual(len({r['id'] for r in results}),1);self.assertEqual(results[0]['seq'],1)
+        self.assertEqual(self.support_send(client,cid,'不同的消息',key=key)[0],409)
+        self.assertEqual(self.support_send(client,cid,'   ')[0],400)
+        self.assertEqual(self.support_send(client,cid,'a'*4001)[0],422)
+        self.assertEqual(client.call('/support/conversations/'+cid+'/read',{'last_seq':999})[0],400)
+        self.assertEqual(client.call('/support/conversations/'+cid+'/messages?after=999')[0],400)
+        payload={'body':'伪造客服','client_id':secrets.token_hex(16),'sender_role':'agent'}
+        self.assertEqual(client.call('/support/conversations/'+cid+'/messages',payload)[0],422)
+
+    def test_support_claim_transfer_and_no_admin_access(self):
+        customer,cid=self.support_start();a,auid=self.support_agent();b,buid=self.support_agent()
+        def claim(client):return client.call('/support/agent/conversations/'+cid+'/claim',{})[0]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:codes=list(pool.map(claim,[a,b]))
+        self.assertEqual(sorted(codes),[200,409])
+        winner,loser=(a,b) if codes[0]==200 else (b,a)
+        target=buid if winner is a else auid
+        self.assertEqual(winner.call('/admin/list/users')[0],403)
+        self.assertEqual(loser.call('/support/conversations/'+cid+'/messages?actor=agent')[0],404)
+        self.assertEqual(self.support_send(winner,cid,'客服回复',actor='agent')[0],200)
+        self.assertEqual(winner.call('/support/agent/conversations/'+cid+'/transfer',{'agent_id':target})[0],200)
+        self.assertEqual(self.support_send(winner,cid,'旧客服不能回复',actor='agent')[0],404)
+        self.assertEqual(self.support_send(loser,cid,'接手后回复',actor='agent')[0],200)
+        self.assertEqual(loser.call('/support/agent/conversations/'+cid+'/close',{})[0],200)
+        self.assertEqual(self.support_send(loser,cid,'结束后不能回复',actor='agent')[0],409)
+        self.assertEqual(self.support_send(customer,cid,'需要继续咨询')[0],200)
+        state=customer.call('/support/conversations/'+cid+'/messages')[1]['conversation']
+        self.assertEqual(state['status'],'waiting');self.assertIsNone(state['assigned_to'])
+
+    def test_support_read_receipts_and_presence_expiry(self):
+        client,cid=self.support_start();agent,uid=self.support_agent()
+        with self._fixture_db() as c:c.execute('UPDATE support_presence SET expires=0')
+        self.assertFalse(client.call('/support/conversations/'+cid+'/messages')[1]['conversation']['online'])
+        self.assertEqual(agent.call('/support/agent/presence',{'online':True})[0],200)
+        self.assertTrue(client.call('/support/conversations/'+cid+'/messages')[1]['conversation']['online'])
+        agent.call('/support/agent/conversations/'+cid+'/claim',{})
+        for i in range(2):self.assertEqual(self.support_send(client,cid,'问题'+str(i))[0],200)
+        for seq in [2,1]:self.assertEqual(agent.call('/support/conversations/'+cid+'/read?actor=agent',{'last_seq':seq})[0],200)
+        self.assertEqual(client.call('/support/conversations/'+cid+'/messages')[1]['conversation']['other_read_seq'],2)
+        self.support_send(agent,cid,'收到，我来处理',actor='agent')
+        self.assertEqual(client.call('/support/conversations/'+cid+'/messages')[1]['conversation']['unread'],1)
+        self.assertEqual(client.call('/support/unread')[1]['unread'],1)
+        client.call('/support/conversations/'+cid+'/read',{'last_seq':3})
+        self.assertEqual(client.call('/support/conversations/'+cid+'/messages')[1]['conversation']['unread'],0)
+        self.assertEqual(client.call('/support/unread')[1]['unread'],0)
+        with self._fixture_db() as c:c.execute('UPDATE support_presence SET expires=0 WHERE user_id=%s',(uid,))
+        self.assertFalse(client.call('/support/conversations/'+cid+'/messages')[1]['conversation']['online'])
+
+    def test_support_private_attachments_and_validation(self):
+        import io,base64
+        from PIL import Image
+        client,cid=self.support_start();other,other_id=self.support_start()
+        raw=io.BytesIO();Image.new('RGB',(10,10),'white').save(raw,'PNG');encoded=base64.b64encode(raw.getvalue()).decode()
+        status,uploaded=client.call('/support/attachments',{'conversation_id':cid,'data':encoded})
+        self.assertEqual(status,200,uploaded);aid=uploaded['id']
+        with client.opener.open(self.base+'/api/support/attachments/'+aid) as r:
+            self.assertEqual(r.headers['Content-Type'],'image/webp');Image.open(io.BytesIO(r.read())).verify()
+        self.assertEqual(other.call('/support/attachments/'+aid)[0],404)
+        self.assertEqual(self.support_send(other,other_id,attachment=aid)[0],400)
+        self.assertEqual(self.support_send(client,cid,attachment=aid)[0],200)
+        self.assertEqual(self.support_send(client,cid,attachment=aid)[0],400)
+        bad=base64.b64encode(b'<svg onload="alert(1)"></svg>').decode()
+        self.assertEqual(client.call('/support/attachments',{'conversation_id':cid,'data':bad})[0],400)
+        self.assertEqual(client.call('/support/attachments',{'conversation_id':other_id,'data':encoded})[0],404)
+        self.assertEqual(client.call('/support/attachments',{'conversation_id':cid,'data':'a'*1400001})[0],422)
+
+    def test_support_order_binding_and_ticket_conversion(self):
+        user,_=self.user();user,cid=self.support_start(user);other,_=self.user();private,_=self.order(other)
+        self.assertEqual(user.call('/support/conversations/'+cid+'/order',{'order_id':private['id']})[0],404)
+        own,_=self.order(user);self.assertEqual(user.call('/support/conversations/'+cid+'/order',{'order_id':own['id']})[0],200)
+        agent,_=self.support_agent();agent.call('/support/agent/conversations/'+cid+'/claim',{})
+        body={'title':'在线咨询转售后','body':'请协助处理此订单的问题，这是客服整理的具体情况。','priority':'high'}
+        self.assertEqual(agent.call('/support/agent/conversations/'+cid+'/ticket',body)[0],400)
+        user.call('/orders/'+own['id']+'/pay',{'method':'mock'})
+        status,ticket=agent.call('/support/agent/conversations/'+cid+'/ticket',body);self.assertEqual(status,200,ticket)
+        self.assertEqual(agent.call('/support/agent/conversations/'+cid+'/ticket',body)[1]['id'],ticket['id'])
+        self.assertEqual(user.call('/tickets')[1]['items'][0]['id'],ticket['id'])
+        order=agent.call('/support/conversations/'+cid+'/messages?actor=agent')[1]['conversation']['order']
+        self.assertNotIn('delivery',order);self.assertNotIn('account',order);self.assertNotIn('balance',order)
+        self.assertEqual(other.call('/tickets')[1]['total'],0)
+
+    def test_support_sse_replay_and_logout_revocation(self):
+        user,_=self.user();user,cid=self.support_start(user)
+        self.support_send(user,cid,'first');self.support_send(user,cid,'second')
+        request=urllib.request.Request(self.base+'/api/support/conversations/'+cid+'/events?after=0',headers={'Last-Event-ID':'1'})
+        with user.opener.open(request,timeout=10) as stream:
+            lines=[]
+            for _ in range(8):
+                line=stream.readline().decode();lines.append(line)
+                if line.startswith('data:') and 'second' in line:break
+            self.assertIn('id: 2', ''.join(lines));self.assertNotIn('first',''.join(lines))
+            user.call('/auth/logout',{})
+            revoked=False
+            for _ in range(15):
+                line=stream.readline().decode()
+                if 'event: revoked' in line:revoked=True;break
+                if not line:break
+            self.assertTrue(revoked)
+
+    def test_support_sse_connection_limit(self):
+        client,cid=self.support_start();streams=[]
+        try:
+            for _ in range(2):
+                stream=client.opener.open(self.base+'/api/support/conversations/'+cid+'/events',timeout=10);streams.append(stream);stream.readline()
+            self.assertEqual(client.call('/support/conversations/'+cid+'/events')[0],429)
+        finally:
+            for stream in streams:stream.close()
+
+    def test_support_replay_from_another_backend_process(self):
+        client,cid=self.support_start();self.support_send(client,cid,'跨进程恢复消息')
+        with socket.socket() as sock:sock.bind(('127.0.0.1',0));port=sock.getsockname()[1]
+        env={**os.environ,'DATABASE_URL':database_url(),'DATABASE_SCHEMA':self.schema,'APP_ENV':'test','MOCK_MODE':'true','SUPPORT_ATTACHMENT_DIR':str(Path(self.temp.name)/'support-images')}
+        with tempfile.TemporaryFile(mode='w+') as log:
+            server=subprocess.Popen([sys.executable,'-m','uvicorn','backend.app:app','--host','127.0.0.1','--port',str(port)],env=env,stdout=log,stderr=log)
+            try:
+                fresh=Client(f'http://127.0.0.1:{port}');fresh.opener=client.opener
+                for _ in range(100):
+                    try:
+                        if fresh.call('/config')[0]==200:break
+                    except OSError:time.sleep(.05)
+                self.assertEqual(fresh.call('/support/conversations/'+cid+'/messages')[1]['messages'][0]['body'],'跨进程恢复消息')
+            finally:server.terminate();server.wait(timeout=10)
+
+    def test_support_faq_edit_is_admin_only(self):
+        agent,_=self.support_agent();admin,_=self.admin_user()
+        body={'category':'订单问题','question':'如何查看状态？','answer':'请前往订单查询页面。'}
+        self.assertEqual(agent.call('/support/faqs/1',body)[0],403)
+        self.assertEqual(admin.call('/support/faqs/1',body)[0],200)
+        self.assertEqual(Client(self.base).call('/support/faqs')[1]['items'][0]['answer'],body['answer'])
+
+    def test_support_login_switch_cannot_reuse_guest_conversation(self):
+        guest,gid=self.support_start();self.support_send(guest,gid,'游客私有消息')
+        password='Support-test-pass-42'
+        status,_=guest.call('/auth/register',{'account':secrets.token_hex(6)+'@example.test','password':password,'confirmation':password})
+        self.assertEqual(status,200)
+        _,member_id=self.support_start(guest);self.assertNotEqual(member_id,gid)
+        self.assertEqual(guest.call('/support/conversations/'+gid+'/messages')[0],404)
+        self.support_send(guest,member_id,'会员私有消息')
+        guest.call('/auth/logout',{})
+        self.assertEqual(guest.call('/support/conversations/'+member_id+'/messages')[0],404)
+        self.assertEqual(guest.call('/support/conversations/'+gid+'/messages')[1]['messages'][0]['body'],'游客私有消息')
+
+    def test_support_messages_append_only_for_runtime(self):
+        with psycopg.connect(database_url().replace('postgresql+psycopg://','postgresql://',1),options='-c search_path='+self.schema) as c:
+            self.assertFalse(c.execute("SELECT has_table_privilege(current_user,'support_messages','UPDATE')").fetchone()[0])
+            self.assertFalse(c.execute("SELECT has_table_privilege(current_user,'support_messages','DELETE')").fetchone()[0])
+
+    def test_support_agent_cannot_receive_guest_order_lookup_secret(self):
+        guest,order,_=self.guest_order();guest,cid=self.support_start(guest)
+        self.assertEqual(guest.call('/support/conversations/'+cid+'/order',{'order_id':order['id']})[0],200)
+        agent,_=self.support_agent();agent.call('/support/agent/conversations/'+cid+'/claim',{})
+        packet=agent.call('/support/conversations/'+cid+'/messages?actor=agent')[1]
+        self.assertNotIn(order['id'],json.dumps(packet))
+        self.assertTrue(packet['conversation']['order']['id'].endswith(order['id'][-12:]))
+        own=guest.call('/support/conversations/'+cid+'/messages')[1]
+        self.assertEqual(own['conversation']['order_id'],order['id'])
 
 if __name__=='__main__':unittest.main()

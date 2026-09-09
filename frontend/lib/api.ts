@@ -8,9 +8,12 @@ export async function api<T = Record<string, unknown>>(path: string, body?: unkn
     credentials:'same-origin',
     body: body === undefined ? undefined : JSON.stringify(body),
     cache:'no-store',
+    signal:path.startsWith('/support/')?AbortSignal.timeout(15000):undefined,
   });
   const data = await response.json().catch(() => ({}));
   if (!response.ok) throw new ApiError(typeof data.detail === 'string' ? data.detail : '请求失败，请检查输入或稍后重试',response.status);
+  if(body!==undefined&&typeof window!=='undefined'&&(['/auth/login','/auth/register','/auth/logout','/auth/reset','/me/password'].includes(path))){window.dispatchEvent(new Event('piusgo-auth-changed'));if(typeof BroadcastChannel!=='undefined'){const channel=new BroadcastChannel('piusgo-auth');channel.postMessage('changed');channel.close();}}
+  if(body!==undefined&&typeof window!=='undefined'&&(path==='/orders'||/^\/orders\/[^/]+\/pay$/.test(path)))window.dispatchEvent(new Event('piusgo-orders-changed'));
   return data;
 }
 export async function serverApi<T>(path: string): Promise<T> {

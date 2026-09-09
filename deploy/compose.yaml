@@ -55,6 +55,7 @@ services:
     environment: *backend-env
     volumes:
       - product_images:/app/backend/data/product-images
+      - support_attachments:/app/backend/data/support-attachments
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -114,5 +115,6 @@ services:
 volumes:
   postgres_data:
   product_images:
+  support_attachments:
   caddy_data:
   caddy_config:
